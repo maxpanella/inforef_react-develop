@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema Completo Implementazione BlueIOT + Verge3D</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        
+        .architecture-diagram {
+            background: white;
+            border-radius: 10px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .component {
+            background: #fff;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            position: relative;
+        }
+        
+        .component h2 {
+            margin-top: 0;
+            color: #2196F3;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .component h3 {
+            color: #1976D2;
+            margin-top: 20px;
+        }
+        
+        .file-structure {
+            background: #263238;
+            color: #aed581;
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            margin: 15px 0;
+            overflow-x: auto;
+        }
+        
+        .code-block {
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 10px 0;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+        }
+        
+        .step {
+            background: #e3f2fd;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 0 5px 5px 0;
+        }
+        
+        .warning {
+            background: #fff3cd;
+            border-left: 4px solid #ff9800;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 0 5px 5px 0;
+        }
+        
+        .success {
+            background: #d4edda;
+            border-left: 4px solid #4caf50;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 0 5px 5px 0;
+        }
+        
+        .flow-diagram {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 20px 0;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        
+        .flow-box {
+            background: #2196F3;
+            color: white;
+            padding: 15px 25px;
+            border-radius: 8px;
+            text-align: center;
+            flex: 1;
+            min-width: 150px;
+        }
+        
+        .flow-arrow {
+            font-size: 24px;
+            color: #666;
+        }
+        
+        .icon {
+            width: 24px;
+            height: 24px;
+            display: inline-block;
+            vertical-align: middle;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        
+        th {
+            background: #f0f0f0;
+            font-weight: bold;
+        }
+        
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            background: #e0e0e0;
+            border-radius: 3px;
+            font-size: 12px;
+            margin: 2px;
+        }
+        
+        .tag.new {
+            background: #4caf50;
+            color: white;
+        }
+        
+        .tag.modified {
+            background: #ff9800;
+            color: white;
+        }
+        
+        .checklist {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .checklist li {
+            padding: 8px 0;
+            padding-left: 30px;
+            position: relative;
+        }
+        
+        .checklist li:before {
+            content: "☐";
+            position: absolute;
+            left: 0;
+            font-size: 20px;
+        }
+        
+        .checklist li.done:before {
+            content: "☑";
+            color: #4caf50;
+        }
+    </style>
+</head>
+<body>
+    <h1>🏗️ Schema Completo: BlueIOT + SGSL + Verge3D</h1>
+    
+    <div class="architecture-diagram">
+        <h2>📊 Architettura del Sistema</h2>
+        <div class="flow-diagram">
+            <div class="flow-box" style="background: #4caf50;">
+                <strong>BlueIOT Hardware</strong><br>
+                Tag RFID + Antenne
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-box" style="background: #2196F3;">
+                <strong>React Frontend</strong><br>
+                Dashboard + Controlli
+            </div>
+            <div class="flow-arrow">↔</div>
+            <div class="flow-box" style="background: #ff5722;">
+                <strong>WebSocket Server</strong><br>
+                Ponte Comunicazione
+            </div>
+            <div class="flow-arrow">↔</div>
+            <div class="flow-box" style="background: #9c27b0;">
+                <strong>Verge3D</strong><br>
+                Visualizzazione 3D
+            </div>
+        </div>
+        
+        <div class="flow-diagram" style="margin-top: 30px;">
+            <div class="flow-box" style="background: #ff9800;">
+                <strong>SGSL CRM</strong><br>
+                Dati Dipendenti/Asset
+            </div>
+            <div class="flow-arrow">↓</div>
+            <div class="flow-box" style="background: #607d8b;">
+                <strong>SQLite DB</strong><br>
+                Storage Locale
+            </div>
+            <div class="flow-arrow">↑</div>
+            <div class="flow-box" style="background: #795548;">
+                <strong>Node.js Backend</strong><br>
+                API Server
+            </div>
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>📁 Struttura Completa dei File</h2>
+        
+        <div class="file-structure">
+progetto-blueiot/
+├── 📁 <strong>frontend (React)</strong>
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── DashboardPage.js
+│   │   │   ├── MapManagementPage.js
+│   │   │   ├── ConfigurationPage.js
+│   │   │   ├── DxfViewer.js
+│   │   │   ├── ConnectionStatus.js
+│   │   │   ├── Verge3DControl.js <span class="tag new">NUOVO</span>
+│   │   │   └── Verge3DAdvancedControl.js <span class="tag new">NUOVO</span>
+│   │   ├── context/
+│   │   │   ├── AuthContext.js
+│   │   │   └── DataContext.js <span class="tag modified">MODIFICATO</span>
+│   │   ├── hooks/
+│   │   │   └── useVerge3DConnection.js <span class="tag new">NUOVO</span>
+│   │   ├── services/
+│   │   │   ├── blueiotClient.js
+│   │   │   ├── crmClient.js
+│   │   │   └── env.js
+│   │   └── App.js
+│   ├── public/
+│   │   └── dxf-examples/
+│   └── .env.local
+│
+├── 📁 <strong>server (Node.js)</strong>
+│   ├── server.js
+│   ├── websocket-verge3d.js <span class="tag new">NUOVO</span>
+│   ├── database.sqlite
+│   ├── package.json
+│   └── .env
+│
+└── 📁 <strong>verge3d (Progetto Verge3D)</strong>
+    ├── blueiot-connector.js <span class="tag new">NUOVO</span>
+    ├── blueiot-integration.js <span class="tag new">NUOVO</span>
+    ├── your_project.html
+    ├── your_project.js
+    └── visual_logic.js (Puzzles)
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>🚀 Implementazione Step-by-Step</h2>
+        
+        <h3>Step 1: Setup Backend</h3>
+        
+        <div class="step">
+            <h4>1.1 Avvia il server principale</h4>
+            <div class="code-block">
+cd server
+npm install
+node server.js
+# Server in ascolto su http://localhost:4000
+            </div>
+        </div>
+        
+        <div class="step">
+            <h4>1.2 Avvia il WebSocket per Verge3D</h4>
+            <div class="code-block">
+# In un nuovo terminale
+cd server
+node websocket-verge3d.js
+# WebSocket in ascolto su ws://localhost:4001
+            </div>
+        </div>
+        
+        <h3>Step 2: Configurazione Frontend React</h3>
+        
+        <div class="step">
+            <h4>2.1 Aggiungi le variabili d'ambiente</h4>
+            <p>Nel file <code>.env.local</code>:</p>
+            <div class="code-block">
+REACT_APP_USE_MOCK_DATA=false
+REACT_APP_COMPANY_ID=1
+REACT_APP_COMPANY_NAME=Impresa Costruzioni SRL
+REACT_APP_ADMIN_USERNAME=admin@example.com
+REACT_APP_ADMIN_PASSWORD_HASH=5f4dcc3b5aa765d61d8327deb882cf99
+REACT_APP_CRM_BASE_URL=https://apidemobo01.sgslweb.com
+REACT_APP_BACKEND_URL=http://localhost:4000
+REACT_APP_BLUEIOT_HOST=ws://192.168.1.11:48300
+REACT_APP_VERGE3D_WS_URL=ws://localhost:4001/verge3d
+            </div>
+        </div>
+        
+        <div class="step">
+            <h4>2.2 Implementa i nuovi componenti</h4>
+            <p>Copia i file nella struttura indicata:</p>
+            <ul>
+                <li><code>src/hooks/useVerge3DConnection.js</code></li>
+                <li><code>src/components/Verge3DControl.js</code></li>
+                <li><code>src/components/Verge3DAdvancedControl.js</code></li>
+            </ul>
+        </div>
+        
+        <div class="step">
+            <h4>2.3 Aggiorna il DataContext</h4>
+            <p>Sostituisci <code>src/context/DataContext.js</code> con la versione aggiornata che include <code>refreshData</code></p>
+        </div>
+        
+        <div class="step">
+            <h4>2.4 Aggiungi il controllo Verge3D alla Dashboard</h4>
+            <p>In <code>src/pages/DashboardPage.js</code>, aggiungi:</p>
+            <div class="code-block">
+import Verge3DControl from '../components/Verge3DControl';
+
+// Nel return del componente, aggiungi:
+&lt;div className="mt-6"&gt;
+    &lt;Verge3DControl /&gt;
+&lt;/div&gt;
+            </div>
+        </div>
+        
+        <h3>Step 3: Setup Verge3D</h3>
+        
+        <div class="step">
+            <h4>3.1 Copia i file JavaScript</h4>
+            <p>Nella cartella del tuo progetto Verge3D, copia:</p>
+            <ul>
+                <li><code>blueiot-connector.js</code> (connessione WebSocket base)</li>
+                <li><code>blueiot-integration.js</code> (logica di integrazione)</li>
+            </ul>
+        </div>
+        
+        <div class="step">
+            <h4>3.2 Modifica il file HTML del progetto</h4>
+            <p>In <code>your_project.html</code>, aggiungi prima del tag di chiusura <code>&lt;/body&gt;</code>:</p>
+            <div class="code-block">
+&lt;!-- BlueIOT Integration --&gt;
+&lt;script src="blueiot-connector.js"&gt;&lt;/script&gt;
+&lt;script src="blueiot-integration.js"&gt;&lt;/script&gt;
+
+&lt;!-- CSS per i pannelli informativi --&gt;
+&lt;style&gt;
+    #employee-info-panel {
+        font-family: Arial, sans-serif;
+    }
+    
+    .tag-label {
+        user-select: none;
+        -webkit-user-select: none;
+    }
+    
+    .info-panel {
+        backdrop-filter: blur(10px);
+    }
+&lt;/style&gt;
+            </div>
+        </div>
+        
+        <div class="step">
+            <h4>3.3 Configura i Puzzles</h4>
+            <p>Nell'editor Puzzles di Verge3D, crea questi blocchi:</p>
+            <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='200'%3E%3Crect width='400' height='200' fill='%23e3f2fd'/%3E%3Ctext x='20' y='30' font-family='Arial' font-size='14'%3Ewhen started%3C/text%3E%3Ctext x='40' y='60' font-family='Arial' font-size='14'%3Edo%3C/text%3E%3Ctext x='60' y='90' font-family='Arial' font-size='14'%3Eexec script: BlueIOT.init(app);%3C/text%3E%3C/svg%3E" alt="Puzzle initialization">
+        </div>
+        
+        <h3>Step 4: Mappatura Oggetti</h3>
+        
+        <div class="step">
+            <h4>4.1 Nomina gli oggetti nella scena</h4>
+            <p>In Blender/3ds Max prima di esportare:</p>
+            <ul>
+                <li>Rinomina gli oggetti con nomi descrittivi: <code>Escavatore_01</code>, <code>Gru_Torre_A</code></li>
+                <li>Organizza in layer: <code>Employees_Layer</code>, <code>Assets_Layer</code>, <code>Safety_Zones</code></li>
+            </ul>
+        </div>
+        
+        <div class="step">
+            <h4>4.2 Mappa gli oggetti ai tag</h4>
+            <p>Opzione A - Via Puzzles:</p>
+            <div class="code-block">
+when started
+  do
+    wait 2 sec
+    exec script:
+      BlueIOT.mapObjectToTag(app, 'Escavatore_01', 'TAG001');
+      BlueIOT.mapObjectToTag(app, 'Gru_Torre_A', 'TAG002');
+            </div>
+            
+            <p>Opzione B - Via interfaccia React:</p>
+            <ol>
+                <li>Vai nel pannello "Controllo Verge3D"</li>
+                <li>Clicca "Attiva Mappatura"</li>
+                <li>Seleziona tag e inserisci nome oggetto</li>
+                <li>Clicca "Associa"</li>
+            </ol>
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>🔄 Flusso Dati Completo</h2>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>Azione</th>
+                    <th>Origine</th>
+                    <th>Percorso</th>
+                    <th>Destinazione</th>
+                    <th>Risultato</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Tag si muove</td>
+                    <td>BlueIOT Hardware</td>
+                    <td>WebSocket → React → WS Server</td>
+                    <td>Verge3D</td>
+                    <td>Oggetto 3D si muove</td>
+                </tr>
+                <tr>
+                    <td>Click su dipendente</td>
+                    <td>React Dashboard</td>
+                    <td>WS Server → WebSocket</td>
+                    <td>Verge3D</td>
+                    <td>Mostra pannello info</td>
+                </tr>
+                <tr>
+                    <td>Click su oggetto 3D</td>
+                    <td>Verge3D</td>
+                    <td>WebSocket → WS Server</td>
+                    <td>React</td>
+                    <td>Evidenzia in dashboard</td>
+                </tr>
+                <tr>
+                    <td>Allarme generato</td>
+                    <td>BlueIOT</td>
+                    <td>React → WS Server</td>
+                    <td>Verge3D</td>
+                    <td>Oggetto lampeggia rosso</td>
+                </tr>
+                <tr>
+                    <td>Import da CRM</td>
+                    <td>React Config</td>
+                    <td>API → SQLite</td>
+                    <td>Database</td>
+                    <td>Dati salvati localmente</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="component">
+        <h2>⚙️ Configurazioni Chiave</h2>
+        
+        <h3>WebSocket Server (websocket-verge3d.js)</h3>
+        <div class="warning">
+            <strong>Importante:</strong> Il server WebSocket deve girare su una porta diversa dal server principale.
+        </div>
+        
+        <table>
+            <tr>
+                <th>Parametro</th>
+                <th>Valore Default</th>
+                <th>Descrizione</th>
+            </tr>
+            <tr>
+                <td>PORT</td>
+                <td>4001</td>
+                <td>Porta WebSocket (diversa da server principale)</td>
+            </tr>
+            <tr>
+                <td>Path BlueIOT</td>
+                <td>/verge3d?client=blueiot</td>
+                <td>Endpoint per connessioni React</td>
+            </tr>
+            <tr>
+                <td>Path Verge3D</td>
+                <td>/verge3d?client=verge3d</td>
+                <td>Endpoint per connessioni Verge3D</td>
+            </tr>
+        </table>
+        
+        <h3>Mappatura Tag-Oggetti</h3>
+        <div class="code-block">
+// Esempio di configurazione mappature predefinite
+const DEFAULT_MAPPINGS = {
+    'TAG001': 'Operaio_01',      // Dipendente
+    'TAG002': 'Operaio_02',      // Dipendente
+    'TAG003': 'Escavatore_A',    // Asset
+    'TAG004': 'Gru_Torre_01',    // Asset
+    'TAG005': 'Betoniera_01',    // Asset
+    'TAG006': 'Camion_01',       // Asset
+};
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>🐛 Troubleshooting</h2>
+        
+        <h3>Problemi Comuni e Soluzioni</h3>
+        
+        <div class="warning">
+            <h4>❌ "WebSocket connection failed"</h4>
+            <ul>
+                <li>Verifica che <code>websocket-verge3d.js</code> sia in esecuzione</li>
+                <li>Controlla che la porta 4001 non sia già in uso</li>
+                <li>Verifica il firewall per connessioni WebSocket</li>
+            </ul>
+        </div>
+        
+        <div class="warning">
+            <h4>❌ "Oggetti non si muovono in Verge3D"</h4>
+            <ul>
+                <li>Controlla la console per errori JavaScript</li>
+                <li>Verifica che <code>BlueIOT.init(app)</code> sia stato chiamato</li>
+                <li>Assicurati che i tag siano mappati correttamente</li>
+                <li>Controlla che le coordinate siano nel range corretto</li>
+            </ul>
+        </div>
+        
+        <div class="warning">
+            <h4>❌ "Pannello dipendente non appare"</h4>
+            <ul>
+                <li>Verifica che il CSS sia incluso nel file HTML</li>
+                <li>Controlla z-index del pannello (deve essere alto)</li>
+                <li>Assicurati che l'elemento sia aggiunto al DOM</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>✅ Checklist di Verifica</h2>
+        
+        <ul class="checklist">
+            <li>Server Node.js avviato (porta 4000)</li>
+            <li>WebSocket Server avviato (porta 4001)</li>
+            <li>Database SQLite creato e popolato</li>
+            <li>Variabili d'ambiente configurate (.env.local)</li>
+            <li>Componenti React aggiunti e importati</li>
+            <li>File JavaScript copiati in Verge3D</li>
+            <li>Script inclusi nel file HTML di Verge3D</li>
+            <li>Puzzle di inizializzazione creato</li>
+            <li>Oggetti 3D rinominati correttamente</li>
+            <li>Test connessione WebSocket riuscito</li>
+            <li>Prima mappatura tag-oggetto funzionante</li>
+            <li>Click su oggetti 3D gestito</li>
+            <li>Pannello informazioni visibile</li>
+            <li>Aggiornamenti posizione in tempo reale</li>
+        </ul>
+    </div>
+
+    <div class="component">
+        <h2>🚦 Test del Sistema</h2>
+        
+        <div class="success">
+            <h4>Test 1: Connessione Base</h4>
+            <ol>
+                <li>Apri React Dashboard</li>
+                <li>Controlla indicatore "Connesso a BlueIOT"</li>
+                <li>Apri progetto Verge3D</li>
+                <li>Controlla console: "✅ Connesso a BlueIOT!"</li>
+            </ol>
+        </div>
+        
+        <div class="success">
+            <h4>Test 2: Movimento Tag</h4>
+            <ol>
+                <li>In React, vai su "Tag Attivi"</li>
+                <li>Osserva un tag con posizione</li>
+                <li>In Verge3D, verifica che l'oggetto corrispondente si muova</li>
+                <li>Il movimento deve essere fluido e in tempo reale</li>
+            </ol>
+        </div>
+        
+        <div class="success">
+            <h4>Test 3: Interazione</h4>
+            <ol>
+                <li>In Verge3D, clicca su un oggetto mappato</li>
+                <li>Deve apparire il pannello informazioni</li>
+                <li>In React, clicca "Evidenzia" su un tag</li>
+                <li>L'oggetto in Verge3D deve illuminarsi</li>
+            </ol>
+        </div>
+    </div>
+
+    <div class="component">
+        <h2>📚 Prossimi Passi</h2>
+        
+        <div class="step">
+            <h4>1. Personalizzazione Grafica</h4>
+            <ul>
+                <li>Sostituisci geometrie base con modelli 3D dettagliati</li>
+                <li>Aggiungi texture e materiali PBR</li>
+                <li>Implementa effetti particellari per allarmi</li>
+                <li>Crea animazioni per stati diversi</li>
+            </ul>
+        </div>
+        
+        <div class="step">
+            <h4>2. Funzionalità Avanzate</h4>
+            <ul>
+                <li>Registrazione percorsi (heatmap)</li>
+                <li>Analisi collisioni in tempo reale</li>
+                <li>Report automatici fine giornata</li>
+                <li>Integrazione telecamere CCTV</li>
+                <li>Sistema di notifiche push</li>
+            </ul>
+        </div>
+        
+        <div class="step">
+            <h4>3. Ottimizzazioni</h4>
+            <ul>
+                <li>Implementa LOD (Level of Detail) per performance</li>
+                <li>Aggiungi caching per dati statici</li>
+                <li>Comprimi messaggi WebSocket</li>
+                <li>Implementa reconnection logic robusta</li>
+            </ul>
+        </div>
+    </div>
+
+</body>
+</html>
