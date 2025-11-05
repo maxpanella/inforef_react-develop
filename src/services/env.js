@@ -17,7 +17,7 @@
 // });
 
 export const env = {
-  useMock: process.env.REACT_APP_USE_MOCK_DATA === "true",
+  useMock: process.env.REACT_APP_USE_MOCK_DATA === "false",
   companyId: process.env.REACT_APP_COMPANY_ID || "1",
   companyName: process.env.REACT_APP_COMPANY_NAME || "Impresa Demo",
   adminUser: process.env.REACT_APP_ADMIN_USERNAME || "admin@example.com",
