@@ -1,0 +1,38 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Chrome and open app",
+      "type": "pwa-chrome",
+      "request": "launch",
+      "url": "http://localhost:3000",
+      "webRoot": "${workspaceFolder}/src",
+      "preLaunchTask": "npm: start (root)",
+      "runtimeArgs": [
+        "--user-data-dir=${workspaceFolder}/.vscode/chrome",
+        "--remote-debugging-port=9222"
+      ]
+    },
+    {
+      "name": "Attach to Chrome (remote)",
+      "type": "pwa-chrome",
+      "request": "attach",
+      "port": 9222,
+      "webRoot": "${workspaceFolder}/src"
+    },
+    {
+      "name": "Launch Edge and open app",
+      "type": "pwa-msedge",
+      "request": "launch",
+      "url": "http://localhost:3000",
+      "webRoot": "${workspaceFolder}/src",
+      "preLaunchTask": "npm: start (root)"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Launch client + server",
+      "configurations": ["Launch Chrome and open app"]
+    }
+  ]
+}

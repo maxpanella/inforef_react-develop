@@ -1,6 +1,6 @@
 class MockBlueIOTClient {
 	constructor({
-		serverIp = '127.0.0.1',
+		serverIp = '192.168.1.11',
 		serverPort = 48300,
 		username = 'admin',
 		password = '#BlueIOT',
