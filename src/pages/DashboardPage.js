@@ -2,6 +2,9 @@ import React, { useEffect, useState } from "react";
 import { useData } from "../context/DataContext";
 import { DxfViewer } from "../components/DxfViewer";
 
+// Disattiva i tag finti di test
+const SHOW_FAKE_TAGS = false;
+
 const DashboardPage = () => {
   const {
     sites,
@@ -31,33 +34,32 @@ const DashboardPage = () => {
 
   // Caricamento dei dati della mappa dal localStorage
   useEffect(() => {
-    setIsLoading(true);
-    try {
-      // Tenta di caricare i dati della mappa dal localStorage
-      const savedMapData = localStorage.getItem("blueiot_mapData");
+    let cancelled = false;
+    const load = async () => {
+      setIsLoading(true);
+      try {
+        const savedMapData = localStorage.getItem("blueiot_mapData");
 
-      if (savedMapData) {
-        console.log("Mappa caricata dal localStorage");
-        setMapData(savedMapData);
-      } else {
-        // Se non ci sono dati salvati, carica esempio
-        console.log("Caricamento mappa di esempio");
-        fetch("/dxf-examples/example.dxf")
-          .then((response) => {
-            if (!response.ok) {
-              throw new Error(`HTTP error! Status: ${response.status}`);
-            }
-            return response.text();
-          })
-          .then((data) => {
-            console.log("Mappa di esempio caricata con successo");
+        if (savedMapData) {
+          console.log("Mappa caricata dal localStorage");
+          if (!cancelled) setMapData(savedMapData);
+        } else {
+          console.log("Caricamento mappa di esempio");
+          const response = await fetch("/dxf-examples/example.dxf");
+          if (!response.ok) {
+            throw new Error(`HTTP error! Status: ${response.status}`);
+          }
+          const data = await response.text();
+          console.log("Mappa di esempio caricata con successo");
+          if (!cancelled) {
             setMapData(data);
             localStorage.setItem("blueiot_mapData", data);
-          })
-          .catch((error) => {
-            console.error("Errore nel caricamento della mappa:", error);
-            // Crea un DXF di fallback
-            const fallbackDxf = `0
+          }
+        }
+      } catch (error) {
+        console.error("Errore nel caricamento della mappa:", error);
+        // Crea un DXF di fallback
+        const fallbackDxf = `0
 SECTION
 2
 ENTITIES
@@ -129,18 +131,23 @@ Layer_1
 ENDSEC
 0
 EOF`;
-            console.log("Usando mappa di fallback");
-            setMapData(fallbackDxf);
-            localStorage.setItem("blueiot_mapData", fallbackDxf);
-          });
+        console.log("Usando mappa di fallback");
+        if (!cancelled) {
+          setMapData(fallbackDxf);
+          localStorage.setItem("blueiot_mapData", fallbackDxf);
+          setError(
+            "Impossibile caricare la mappa. Verifica la configurazione nella sezione Gestione Mappe."
+          );
+        }
+      } finally {
+        if (!cancelled) setIsLoading(false);
       }
-    } catch (error) {
-      console.error("Errore nel caricamento della mappa:", error);
-      setError(
-        "Impossibile caricare la mappa. Verifica la configurazione nella sezione Gestione Mappe."
-      );
-    }
-    setIsLoading(false);
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+    };
   }, [currentSite]);
 
   // Debug per vedere i dati disponibili
@@ -149,7 +156,8 @@ EOF`;
     console.log("Tag associations:", tagAssociations.length);
     console.log("Employees:", employees.length);
     console.log("Assets:", assets.length);
-  }, [positions, tagAssociations, employees, assets]);
+    console.log("isConnected:", isConnected);
+  }, [positions, tagAssociations, employees, assets, isConnected]);
 
   // Aggiorna le posizioni dei tag con informazioni aggiuntive
   useEffect(() => {
@@ -157,11 +165,9 @@ EOF`;
 
     // Per ogni posizione, aggiungi informazioni sull'entità associata
     Object.entries(positions).forEach(([tagId, pos]) => {
-      // Trova l'associazione per questo tag
       const association = tagAssociations.find((a) => a.tagId === tagId);
 
       if (association) {
-        // Trova l'entità associata (dipendente o asset)
         const entity =
           association.targetType === "employee"
             ? employees.find((e) => e.id === association.targetId)
@@ -175,7 +181,6 @@ EOF`;
             entityId: association.targetId,
           };
         } else {
-          // Fallback se l'entità non è trovata ma c'è un'associazione
           positionsWithInfo[tagId] = {
             ...pos,
             name: `${association.targetType} #${association.targetId}`,
@@ -184,7 +189,6 @@ EOF`;
           };
         }
       } else {
-        // Fallback per tag non associati
         positionsWithInfo[tagId] = {
           ...pos,
           name: `Tag ${tagId}`,
@@ -194,9 +198,12 @@ EOF`;
       }
     });
 
-    // Aggiunge manualmente tag fissi se non ci sono posizioni (solo per testing)
-    if (Object.keys(positionsWithInfo).length === 0 && !isConnected) {
-      // Aggiungi alcuni tag fissi per test
+    // NIENTE tag finti se SHOW_FAKE_TAGS è false (default)
+    if (
+      Object.keys(positionsWithInfo).length === 0 &&
+      !isConnected &&
+      SHOW_FAKE_TAGS
+    ) {
       positionsWithInfo["TAG001"] = {
         id: "TAG001",
         x: 31.7,
@@ -254,6 +261,13 @@ EOF`;
       <h1 className="text-2xl font-semibold mb-4">
         Dashboard {currentSite ? `- ${currentSite.name}` : ""}
       </h1>
+
+      <div className="mb-3 text-sm">
+        Stato connessione BlueIot:{" "}
+        <span className={isConnected ? "text-green-600" : "text-red-600"}>
+          {isConnected ? "Connesso a 192.168.1.11" : "Non connesso a 192.168.1.11"}
+        </span>
+      </div>
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
