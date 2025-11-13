@@ -3,6 +3,9 @@ import md5 from "blueimp-md5";
 
 let socket;
 let reconnectTimer;
+let lastRxTs = 0;
+let watchdog = null;
+
 let listeners = {
   tagPosition: [],
   batteryInfo: [],
@@ -17,168 +20,186 @@ let listeners = {
   open: [],
   error: [],
   close: [],
+  rawFrame: [],
+  noData: [],
 };
 
+
+function emit(event, payload) {
+  (listeners[event] || []).forEach((cb) => {
+    try { cb(payload); } catch (e) { console.warn("Listener error", e); }
+  });
+}
+
+
+
 export const RealBlueiotClient = {
-  connect: (serverIp, serverPort) => {
-    const host = `ws://192.168.1.11:48300`;
-    console.log("🔌 TEST HARDCODED - Connessione a:", host);
-    // Use params if provided, otherwise use env values
-    // const host =
-    //   serverIp && serverPort
-    //     ? `ws://${serverIp}:${serverPort}`
-    //     : env.REACT_APP_BLUEIOT_HOST || "ws://192.168.1.11:48300";
+  // ...existing code...
+// ...existing code...
+connect: (serverIp, serverPort) => {
+  const host = `ws://192.168.1.11:48300`;
+  console.log("🔌 TEST HARDCODED - Connessione a:", host);
 
-    if (socket) {
-      socket.close();
+  if (socket) {
+    try { socket.close(); } catch {}
+    socket = null;
+  }
+
+  socket = new WebSocket(host);
+  socket.binaryType = "arraybuffer";
+
+  socket.onopen = () => {
+    console.log("[BlueIot] WS aperto (real client)");
+    emit("open");
+    lastRxTs = Date.now();
+
+    // Watchdog: se non arrivano frame dopo l'auth, avvisa
+    clearInterval(watchdog);
+    watchdog = setInterval(() => {
+      const gap = Date.now() - lastRxTs;
+      if (gap > 10000) {
+        console.warn("[BlueIot] Nessun dato ricevuto negli ultimi", Math.round(gap/1000), "s. Controlla credenziali/subscribe.");
+        emit("noData", { ms: gap });
+      }
+    }, 5000);
+
+    // Se il server lo supporta
+    if (typeof RealBlueiotClient.setPosOutType === "function") {
+      RealBlueiotClient.setPosOutType("XY");
     }
 
-    try {
-      console.log("🔌 Connessione a BlueIOT WebSocket:", host);
-      socket = new WebSocket(host, "localSensePush-protocol");
+    // Autenticazione necessaria
+    RealBlueiotClient.authenticate();
 
-      socket.onopen = () => {
-        console.log("✅ WebSocket BlueIOT connesso");
-        // Authenticate with the server
-        RealBlueiotClient.authenticate();
-        // Notify listeners
-        listeners.open.forEach((callback) => {
-          if (typeof callback === "function") {
-            callback();
-          }
-        });
-      };
+    // Facoltativo: subscription (dipende dal server)
+    // RealBlueiotClient.sendTagSubscription("");
+  };
 
-      socket.onmessage = (event) => {
-        // Handle binary data from BlueIOT
-        const data = event.data;
-        if (data instanceof Blob) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const buffer = new Uint8Array(reader.result);
-            // Process the binary data
-            RealBlueiotClient.processData(buffer);
-          };
-          reader.readAsArrayBuffer(data);
-        } else if (typeof data === "string") {
-          // Handle JSON data
-          try {
-            const jsonData = JSON.parse(data);
-            RealBlueiotClient.processJsonData(jsonData);
-          } catch (e) {
-            console.error("Error parsing JSON data:", e);
-          }
-        }
-      };
+  socket.onerror = (err) => {
+    console.error("[BlueIot] WS errore:", err);
+    emit("error", err);
+  };
 
-      socket.onclose = (event) => {
-        console.log(
-          `❌ WebSocket BlueIOT disconnesso: ${event.code} ${event.reason}`
-        );
+  socket.onclose = (ev) => {
+    console.warn("[BlueIot] WS chiuso:", ev?.code, ev?.reason || "");
+    emit("close", ev);
+    clearInterval(watchdog);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      RealBlueiotClient.connect(serverIp, serverPort);
+    }, 4000);
+  };
 
-        // Notify listeners
-        listeners.close.forEach((callback) => {
-          if (typeof callback === "function") {
-            callback(event);
-          }
-        });
+  socket.onmessage = (evt) => {
+    lastRxTs = Date.now();
 
-        // Attempt to reconnect after a delay
-        clearTimeout(reconnectTimer);
-        if (!event.wasClean) {
-          reconnectTimer = setTimeout(() => {
-            console.log("Tentativo di riconnessione...");
-            RealBlueiotClient.connect(serverIp, serverPort);
-          }, 5000);
-        }
-      };
-
-      socket.onerror = (error) => {
-        console.error("WebSocket error:", error);
-
-        // Notify listeners
-        listeners.error.forEach((callback) => {
-          if (typeof callback === "function") {
-            callback(error);
-          }
-        });
-      };
-    } catch (error) {
-      console.error("Error connecting to WebSocket:", error);
+    if (evt.data instanceof ArrayBuffer) {
+      const byteLen = evt.data.byteLength || 0;
+      const hexPreview = Array.from(new Uint8Array(evt.data.slice(0, 32)))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+      console.log("[BlueIot] BIN frame:", byteLen, "bytes |", hexPreview);
+      emit("rawFrame", { type: "bin", byteLen, hexPreview });
+      try {
+        RealBlueiotClient.processData(new Uint8Array(evt.data));
+      } catch (e) {
+        console.warn("Errore parse binario:", e);
+      }
+    } else if (typeof evt.data === "string") {
+      console.log("[BlueIot] TXT frame:", evt.data.slice(0, 120));
+      emit("rawFrame", { type: "text", text: evt.data.slice(0, 300) });
+      try {
+        RealBlueiotClient.processJsonData(JSON.parse(evt.data));
+      } catch {/* non JSON */}
+    } else if (evt.data && typeof evt.data.text === "function") {
+      evt.data.text().then((txt) => {
+        console.log("[BlueIot] BLOB frame:", txt.slice(0, 120));
+        emit("rawFrame", { type: "text", text: txt.slice(0, 300) });
+        try {
+          RealBlueiotClient.processJsonData(JSON.parse(txt));
+        } catch {}
+      });
     }
-  },
+  };
+},
 
-  authenticate: () => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      console.error("Cannot authenticate: socket not open");
-      return;
+// ...existing code...
+sendRawHex: (hex) => {
+  // Invia una stringa esadecimale come frame binario (es: "cc 5f 25 00 01 02 03 04 a1 b2")
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    console.warn("[BlueIot] Socket non aperto");
+    return;
+  }
+  try {
+    const clean = hex.replace(/[^0-9a-fA-F]/g, "");
+    if (clean.length % 2 !== 0) throw new Error("hex dispari");
+    const bytes = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < clean.length; i += 2) {
+      bytes[i / 2] = parseInt(clean.substr(i, 2), 16);
     }
+    socket.send(bytes);
+    console.log("[BlueIot] Inviato HEX:", hex);
+  } catch (e) {
+    console.error("[BlueIot] HEX non valido:", e.message);
+  }
+},
+// ...existing code...
+// ...existing code...
+authenticate: () => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    console.warn("Auth: socket non aperto");
+    return;
+  }
 
-    const username = env.REACT_APP_BLUEIOT_USERNAME || "admin";
-    const password = env.REACT_APP_BLUEIOT_PASSWORD || "#BlueIOT";
-    const salt =
-      env.REACT_APP_BLUEIOT_SALT || "abcdefghijklmnopqrstuvwxyz20191107salt";
+  const username = (process.env.REACT_APP_BLUEIOT_USERNAME || "admin");
+  const password = (process.env.REACT_APP_BLUEIOT_PASSWORD || "#BlueIOT");
+  const salt = (process.env.REACT_APP_BLUEIOT_SALT || "abcdefghijklmnopqrstuvwxyz20191107salt");
 
-    console.log(`Authenticating with username: ${username}`);
+  console.log(`[BlueIot] Autenticazione username=${username}`);
 
-    // Create MD5 hash with salt as described in the protocol
-    const passwordMd5 = md5(password);
-    const saltedMd5 = md5(passwordMd5 + salt);
+  const passwordMd5 = md5(password);
+  const saltedMd5 = md5(passwordMd5 + salt);
 
-    // Build authentication frame as described in protocol
-    const frameHeader = new Uint8Array([0xcc, 0x5f]);
-    const frameType = new Uint8Array([0x27]);
+  const frameHeader = new Uint8Array([0xcc, 0x5f]);
+  const frameType = new Uint8Array([0x27]);
 
-    // Create username fields
-    const usernameBytes = new TextEncoder().encode(username);
-    const usernameLengthBytes = new Uint8Array(4);
-    const usernameLength = usernameBytes.length;
-    usernameLengthBytes[0] = (usernameLength >> 24) & 0xff;
-    usernameLengthBytes[1] = (usernameLength >> 16) & 0xff;
-    usernameLengthBytes[2] = (usernameLength >> 8) & 0xff;
-    usernameLengthBytes[3] = usernameLength & 0xff;
+  const usernameBytes = new TextEncoder().encode(username);
+  const usernameLengthBytes = new Uint8Array([
+    (usernameBytes.length >> 24) & 0xff,
+    (usernameBytes.length >> 16) & 0xff,
+    (usernameBytes.length >> 8) & 0xff,
+    usernameBytes.length & 0xff,
+  ]);
 
-    // Create password fields
-    const passwordBytes = new TextEncoder().encode(saltedMd5);
-    const passwordLengthBytes = new Uint8Array(4);
-    const passwordLength = passwordBytes.length;
-    passwordLengthBytes[0] = (passwordLength >> 24) & 0xff;
-    passwordLengthBytes[1] = (passwordLength >> 16) & 0xff;
-    passwordLengthBytes[2] = (passwordLength >> 8) & 0xff;
-    passwordLengthBytes[3] = passwordLength & 0xff;
+  const passwordBytes = new TextEncoder().encode(saltedMd5);
+  const passwordLengthBytes = new Uint8Array([
+    (passwordBytes.length >> 24) & 0xff,
+    (passwordBytes.length >> 16) & 0xff,
+    (passwordBytes.length >> 8) & 0xff,
+    passwordBytes.length & 0xff,
+  ]);
 
-    // Calculate CRC16
-    const dataForCrc = new Uint8Array([
-      ...frameType,
-      ...usernameLengthBytes,
-      ...usernameBytes,
-      ...passwordLengthBytes,
-      ...passwordBytes,
-    ]);
-    const crc = RealBlueiotClient.calculateCrc16(dataForCrc);
-    const crcBytes = new Uint8Array(2);
-    crcBytes[0] = (crc >> 8) & 0xff;
-    crcBytes[1] = crc & 0xff;
+  const payloadNoCrc = new Uint8Array([
+    ...frameType,
+    ...usernameLengthBytes,
+    ...usernameBytes,
+    ...passwordLengthBytes,
+    ...passwordBytes,
+  ]);
 
-    // Frame tail
-    const frameTail = new Uint8Array([0xaa, 0xbb]);
+  const crc = RealBlueiotClient.calculateCrc16(payloadNoCrc);
+  const crcBytes = new Uint8Array([(crc >> 8) & 0xff, crc & 0xff]);
 
-    // Build complete frame
-    const authFrame = new Uint8Array([
-      ...frameHeader,
-      ...frameType,
-      ...usernameLengthBytes,
-      ...usernameBytes,
-      ...passwordLengthBytes,
-      ...passwordBytes,
-      ...crcBytes,
-      ...frameTail,
-    ]);
+  const fullFrame = new Uint8Array([...frameHeader, ...payloadNoCrc, ...crcBytes]);
 
-    // Send authentication frame
-    socket.send(authFrame);
-    console.log("Richiesta di autenticazione inviata");
-  },
+  try {
+    socket.send(fullFrame);
+    console.log("[BlueIot] Frame autenticazione inviato, bytes:", fullFrame.length);
+  } catch (e) {
+    console.error("Errore invio frame auth:", e);
+  }
+},
+// ...existing code...
 
   processData: (buffer) => {
     if (buffer.length < 4) return; // Not enough data

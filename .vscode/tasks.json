@@ -1,57 +1,66 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "npm: start (root)",
-      "type": "npm",
-      "script": "start",
-      "isBackground": true,
-      "presentation": {
-        "echo": true,
-        "reveal": "always",
-        "panel": "shared"
-      },
-      "options": {
-        "env": {
-          "BROWSER": "none"
-        }
-      },
-      "problemMatcher": {
-        "owner": "custom",
-        "pattern": [
-          {
-            "regexp": ".",
-            "file": 1,
-            "message": 0
-          }
-        ],
-        "background": {
-          "activeOnStart": true,
-          "beginsPattern": "Starting the development server",
-          "endsPattern": "Compiled successfully|Failed to compile"
-        }
-      }
-    },
-    {
-      "label": "node: start server",
-      "type": "shell",
-      "command": "node server/index.js",
-      "isBackground": true,
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "start: client + server (depend)",
-      "type": "shell",
-      "command": "echo Starting client and server",
-      "dependsOn": [
-        "npm: start (root)",
-        "node: start server"
-      ],
-      "problemMatcher": []
-    }
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "npm: start (root)",
+			"type": "npm",
+			"script": "start",
+			"isBackground": true,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"panel": "shared"
+			},
+			"options": {
+				"env": {
+					"BROWSER": "none"
+				}
+			},
+			"problemMatcher": {
+				"owner": "react-eslint",
+				"pattern": [
+					{
+						"regexp": "^([^\\s].*\\.(?:js|jsx|ts|tsx))$",
+						"file": 1
+					},
+					{
+						"regexp": "^\\s*Line\\s+(\\d+):(\\d+):\\s+(.*)$",
+						"line": 1,
+						"column": 2,
+						"message": 3
+					}
+				],
+				"background": {
+					"activeOnStart": true,
+					"beginsPattern": "Starting the development server",
+					"endsPattern": "Compiled successfully|Failed to compile"
+				}
+			}
+		},
+		{
+			"label": "node: start server",
+			"type": "shell",
+			"command": "node",
+			"args": [
+				"server/server.js"
+			],
+			"isBackground": true,
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "start: client + server (depend)",
+			"type": "shell",
+			"command": "echo Starting client and server",
+			"dependsOn": [
+				"npm: start (root)",
+				"node: start server"
+			],
+			"problemMatcher": []
+		},
+		
+	]
 }

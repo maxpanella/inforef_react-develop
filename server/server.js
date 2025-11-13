@@ -168,6 +168,15 @@ if (!dbExists) {
 	});
 }
 
+// Ensure auxiliary tables exist even if DB already existed
+db.serialize(() => {
+	db.run(`CREATE TABLE IF NOT EXISTS map_config (
+		siteId INTEGER PRIMARY KEY,
+		config TEXT,
+		updated DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`);
+});
+
 // === Routes ===
 
 // Avvio server dopo inizializzazione DB
@@ -379,6 +388,37 @@ app.get('/api/map/:siteId', (req, res) => {
 			res.json(row);
 		}
 	);
+});
+
+// Map configuration (calibration etc.)
+app.get('/api/map-config/:siteId', (req, res) => {
+	const siteId = req.params.siteId;
+	db.get(`SELECT config, updated FROM map_config WHERE siteId = ?`, [siteId], (err, row) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		if (!row) return res.json({ config: null });
+		try {
+			const cfg = JSON.parse(row.config);
+			return res.json({ config: cfg, updated: row.updated });
+		} catch(e) {
+			return res.json({ config: null });
+		}
+	});
+});
+
+app.post('/api/map-config', (req, res) => {
+	const { siteId, config } = req.body || {};
+	if (!siteId || typeof config === 'undefined') {
+		return res.status(400).json({ error: 'Missing siteId or config' });
+	}
+	try {
+		const payload = JSON.stringify(config);
+		db.run(`REPLACE INTO map_config (siteId, config, updated) VALUES (?, ?, CURRENT_TIMESTAMP)`, [siteId, payload], (err) => {
+			if (err) return res.status(500).json({ error: 'DB error' });
+			res.json({ success: true });
+		});
+	} catch(e) {
+		return res.status(400).json({ error: 'Invalid config JSON' });
+	}
 });
 
 app.post('/api/associate', (req, res) => {

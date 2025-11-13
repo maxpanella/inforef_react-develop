@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/exhaustive-deps */
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
@@ -8,8 +9,14 @@ export function DxfViewer({
   width = "100%",
   height = "400px",
   tagPositions = {},
+  debugRawPositions = {},
   showTagsMessage = true,
   anchors = [], // Predisposizione per le ancore BlueIOT
+  onTagClick = null, // callback(click) -> tagId
+  onMapClick = null, // callback(click) -> {x, y}
+  onNormalizationChange = null, // callback(ns) quando la mappa viene normalizzata
+  focusPoint = null, // {x,y,ts} opzionale per centrare vista su un punto
+  onBoundsChange = null, // callback(boundsRaw) con {min:{x,y}, max:{x,y}} in unità raw DXF (prima della normalizzazione)
 }) {
   const containerRef = useRef(null);
   const rendererRef = useRef(null);
@@ -19,12 +26,20 @@ export function DxfViewer({
   const animationFrameRef = useRef(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  // Persistenza camera
+  const CAM_STORAGE_KEY = 'dxfViewerCamera_v1';
+  const restoreAttemptedRef = useRef(false);
+  const saveDebounceRef = useRef(null);
 
   // Gruppo per i tag
   const tagsRef = useRef(null);
 
   // Gruppo per le ancore
   const anchorsRef = useRef(null);
+
+  // Gruppo overlay per elementi della mappa (contorni) e fattore di normalizzazione
+  const overlayRef = useRef(null);
+  const normScaleRef = useRef(1);
 
   // Rettangolo di delimitazione della mappa
   const mapBoundsRef = useRef({
@@ -34,18 +49,28 @@ export function DxfViewer({
 
   // Mappa per tenere traccia dei marker dei tag
   const tagMarkersRef = useRef({});
+  // Mappa per marker RAW di debug
+  const rawMarkersRef = useRef({});
+
+  // Raycaster per click / hover
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const pointerRef = useRef(new THREE.Vector2());
+  const [hoverTagId, setHoverTagId] = useState(null);
+  const markerPixelSize = 12; // diametro desiderato in pixel
 
   // Inizializza il renderer Three.js
   useEffect(() => {
-    if (!containerRef.current) return;
+    const containerEl = containerRef.current;
+    if (!containerEl) return;
 
     try {
+  const initialContainerEl = containerEl;
       setLoading(true);
       console.log("Inizializzazione DxfViewer");
 
       // Ottieni le dimensioni del container
-      const width = containerRef.current.clientWidth;
-      const height = containerRef.current.clientHeight;
+  const width = containerEl.clientWidth;
+  const height = containerEl.clientHeight;
 
       // Inizializza la scena Three.js
       const scene = new THREE.Scene();
@@ -57,10 +82,15 @@ export function DxfViewer({
       scene.add(tagsGroup);
       tagsRef.current = tagsGroup;
 
-      // Crea un gruppo per le ancore
+  // Crea un gruppo per le ancore
       const anchorsGroup = new THREE.Group();
       scene.add(anchorsGroup);
       anchorsRef.current = anchorsGroup;
+
+  // Overlay group (contorni, info) con stessa scala della mappa
+  const overlayGroup = new THREE.Group();
+  scene.add(overlayGroup);
+  overlayRef.current = overlayGroup;
 
       // Inizializza la camera
       const camera = new THREE.PerspectiveCamera(
@@ -80,7 +110,7 @@ export function DxfViewer({
       });
       renderer.setSize(width, height);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-      containerRef.current.appendChild(renderer.domElement);
+    containerEl.appendChild(renderer.domElement);
       rendererRef.current = renderer;
 
       // Aggiungi controlli per navigazione
@@ -94,6 +124,29 @@ export function DxfViewer({
       controls.enableRotate = false; // Disabilita rotazione per planimetrie 2D
       controlsRef.current = controls;
 
+      // Funzione salvataggio camera
+      const persistCamera = () => {
+        if (!cameraRef.current || !controlsRef.current) return;
+        try {
+          const cam = cameraRef.current;
+          const target = controlsRef.current.target;
+          const payload = {
+            pos: { x: cam.position.x, y: cam.position.y, z: cam.position.z },
+            target: { x: target.x, y: target.y, z: target.z },
+            ts: Date.now(),
+            normScale: normScaleRef.current || 1,
+          };
+          localStorage.setItem(CAM_STORAGE_KEY, JSON.stringify(payload));
+        } catch(_) {}
+      };
+      // Debounce salvataggio durante interazioni
+      const scheduleSave = () => {
+        if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+        saveDebounceRef.current = setTimeout(persistCamera, 400);
+      };
+      controls.addEventListener('change', scheduleSave);
+      window.addEventListener('beforeunload', persistCamera);
+
       // Aggiungi luci
       const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
       scene.add(ambientLight);
@@ -102,6 +155,33 @@ export function DxfViewer({
       const animate = () => {
         animationFrameRef.current = requestAnimationFrame(animate);
         if (controlsRef.current) controlsRef.current.update();
+        // Mantieni i marker a dimensione costante in pixel
+        if (cameraRef.current && tagsRef.current && rendererRef.current) {
+          const cam = cameraRef.current;
+          const viewH = rendererRef.current.domElement.clientHeight || 1;
+          const vFov = cam.fov * Math.PI / 180;
+          const tmpScale = new THREE.Vector3();
+          tagsRef.current.children.forEach(child => {
+            const obj = child; // marker mesh
+            const dist = Math.abs(cam.position.z - obj.position.z);
+            const worldH = 2 * Math.tan(vFov / 2) * dist;
+            const worldPerPx = worldH / viewH;
+            const desiredWorld = markerPixelSize * worldPerPx; // diametro in world units desiderato
+            const baseRadius = 2; // deve corrispondere a markerSize (raggio locale del cilindro)
+            // Correggi per la scala del parent in modo che la dimensione finale in world non dipenda dal normScale del gruppo
+            let parentScaleX = 1;
+            if (obj.parent) {
+              obj.parent.getWorldScale(tmpScale);
+              parentScaleX = tmpScale.x;
+            }
+            const scaleFactor = (desiredWorld / 2) / (baseRadius * parentScaleX);
+            if (isFinite(scaleFactor) && scaleFactor > 0) {
+              obj.scale.setScalar(scaleFactor);
+              // mantieni spessore (asse della altezza del cilindro) minimo
+              obj.scale.z = Math.max(0.6, obj.scale.z);
+            }
+          });
+        }
         if (rendererRef.current && sceneRef.current && cameraRef.current) {
           rendererRef.current.render(sceneRef.current, cameraRef.current);
         }
@@ -111,11 +191,11 @@ export function DxfViewer({
 
       // Gestione ridimensionamento finestra
       const handleResize = () => {
-        if (!containerRef.current || !rendererRef.current || !cameraRef.current)
+        if (!rendererRef.current || !cameraRef.current)
           return;
 
-        const width = containerRef.current.clientWidth;
-        const height = containerRef.current.clientHeight;
+        const width = containerEl.clientWidth;
+        const height = containerEl.clientHeight;
 
         cameraRef.current.aspect = width / height;
         cameraRef.current.updateProjectionMatrix();
@@ -125,6 +205,61 @@ export function DxfViewer({
 
       window.addEventListener("resize", handleResize);
 
+      // Gestione mouse per raycasting su marker
+      const handlePointerMove = (e) => {
+        if (!rendererRef.current || !cameraRef.current) return;
+        const rect = rendererRef.current.domElement.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+        const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        pointerRef.current.set(x, y);
+        if (!tagsRef.current) return;
+        raycasterRef.current.setFromCamera(pointerRef.current, cameraRef.current);
+        const intersects = raycasterRef.current.intersectObjects(tagsRef.current.children, true);
+        if (intersects.length > 0) {
+          // Risali al marker base
+          let obj = intersects[0].object;
+          while (obj && obj.parent && obj.parent !== tagsRef.current && !obj.userData.tagId) obj = obj.parent;
+          const tid = obj && obj.userData ? obj.userData.tagId : null;
+          setHoverTagId(tid || null);
+          if (tid) {
+            rendererRef.current.domElement.style.cursor = 'pointer';
+          } else {
+            rendererRef.current.domElement.style.cursor = 'default';
+          }
+        } else {
+          setHoverTagId(null);
+          rendererRef.current.domElement.style.cursor = 'default';
+        }
+      };
+      const handleClick = (e) => {
+        const hasTag = !!hoverTagId;
+        if (hasTag) {
+          if (onTagClick) {
+            try { onTagClick(hoverTagId); } catch(_) {}
+          }
+          return;
+        }
+        // click sulla mappa: calcola intersezione con piano z=0
+        if (rendererRef.current && cameraRef.current) {
+          const rect = rendererRef.current.domElement.getBoundingClientRect();
+          const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+          const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+          const vec = new THREE.Vector2(x, y);
+          raycasterRef.current.setFromCamera(vec, cameraRef.current);
+          const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // z=0
+          const hit = new THREE.Vector3();
+          if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
+            const ns = normScaleRef.current || 1;
+            // ritorna coordinate mappa raw (prima della normalizzazione)
+            const pt = { x: hit.x / ns, y: hit.y / ns };
+            try { window.__DXF_LAST_CLICK = pt; } catch(_) {}
+            if (onMapClick) { try { onMapClick(pt); } catch(_) {} }
+          }
+        }
+      };
+      rendererRef.current.domElement.addEventListener('mousemove', handlePointerMove);
+      rendererRef.current.domElement.addEventListener('click', handleClick);
+
       setLoading(false);
       console.log("DxfViewer inizializzato con successo");
 
@@ -132,14 +267,22 @@ export function DxfViewer({
       return () => {
         console.log("Cleanup DxfViewer");
         window.removeEventListener("resize", handleResize);
+        try { window.removeEventListener('beforeunload', () => {}); } catch(_) {}
+        try { controls.removeEventListener('change', scheduleSave); } catch(_) {}
+        if (rendererRef.current) {
+          try {
+            rendererRef.current.domElement.removeEventListener('mousemove', handlePointerMove);
+            rendererRef.current.domElement.removeEventListener('click', handleClick);
+          } catch(_) {}
+        }
 
         if (animationFrameRef.current) {
           cancelAnimationFrame(animationFrameRef.current);
         }
 
-        if (rendererRef.current && containerRef.current) {
-          if (containerRef.current.contains(rendererRef.current.domElement)) {
-            containerRef.current.removeChild(rendererRef.current.domElement);
+        if (rendererRef.current && initialContainerEl) {
+          if (initialContainerEl.contains(rendererRef.current.domElement)) {
+            initialContainerEl.removeChild(rendererRef.current.domElement);
           }
           rendererRef.current.dispose();
         }
@@ -166,43 +309,8 @@ export function DxfViewer({
     }
   }, []);
 
-  // Funzione per limitare le coordinate all'interno del rettangolo della mappa con margine
-  const constrainToMapBounds = (x, y) => {
-    const bounds = mapBoundsRef.current;
-
-    // Calcola le dimensioni della mappa
-    const mapWidth = bounds.max.x - bounds.min.x;
-    const mapHeight = bounds.max.y - bounds.min.y;
-
-    // Applica un margine del 5% dai bordi
-    const marginX = mapWidth * 0.05;
-    const marginY = mapHeight * 0.05;
-
-    // Limita le coordinate all'interno del rettangolo con margine
-    const constrained = {
-      x: Math.max(bounds.min.x + marginX, Math.min(bounds.max.x - marginX, x)),
-      y: Math.max(bounds.min.y + marginY, Math.min(bounds.max.y - marginY, y)),
-    };
-
-    // Se le coordinate originali sono molto lontane, spostale verso il centro
-    const centerX = (bounds.max.x + bounds.min.x) / 2;
-    const centerY = (bounds.max.y + bounds.min.y) / 2;
-
-    // Se il punto è completamente fuori dalla mappa, avvicinalo al centro
-    if (
-      x < bounds.min.x ||
-      x > bounds.max.x ||
-      y < bounds.min.y ||
-      y > bounds.max.y
-    ) {
-      // Sposta verso il centro, ma mantieni una certa casualità
-      const randomOffset = Math.random() * 0.4 + 0.3; // Tra 0.3 e 0.7
-      constrained.x = centerX + (constrained.x - centerX) * randomOffset;
-      constrained.y = centerY + (constrained.y - centerY) * randomOffset;
-    }
-
-    return constrained;
-  };
+  // Conversione coordinate mappa -> mondo (qui identità perché il gruppo tag viene scalato come la mappa)
+  const toWorld = (x, y) => ({ x, y });
 
   // Aggiorna i tag sulla mappa quando le posizioni cambiano
   useEffect(() => {
@@ -237,8 +345,25 @@ export function DxfViewer({
     // Aggiorna o crea nuovi marker
     Object.entries(tagPositions).forEach(([tagId, info]) => {
       try {
-        // Limita le coordinate all'interno del rettangolo della mappa
-        const constrained = constrainToMapBounds(info.x, info.y);
+  // Converte coordinate mappa in mondo normalizzato (senza clamp)
+  const world = toWorld(info.x, info.y);
+
+        // Avviso di diagnostica se il marker è molto lontano dal centro mappa (potrebbe essere fuori planimetria)
+        try {
+          const b = mapBoundsRef.current;
+          if (b) {
+            const cx = (b.min.x + b.max.x) / 2;
+            const cy = (b.min.y + b.max.y) / 2;
+            const dx = world.x - cx; const dy = world.y - cy;
+            const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+            const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+            const diag = Math.sqrt(sizeX*sizeX + sizeY*sizeY) || 1;
+            const dist = Math.hypot(dx, dy);
+            if (dist > diag * 3) {
+              console.warn(`[DxfViewer] Tag ${tagId} molto lontano dalla planimetria (dist=${dist.toFixed(1)} > ${ (diag*3).toFixed(1)}). Verifica calibrazione/offset.`);
+            }
+          }
+        } catch(_) {}
 
         // Usa colori diversi in base al tipo (dipendente o asset)
         const color = info.type === "employee" ? 0x3b82f6 : 0x10b981;
@@ -247,47 +372,96 @@ export function DxfViewer({
         if (tagMarkersRef.current[tagId]) {
           const marker = tagMarkersRef.current[tagId];
           // Posiziona il marker e assicurati che sia visibile sopra la mappa
-          marker.position.set(constrained.x, constrained.y, 10); // Aumentato l'asse Z per maggiore sicurezza
+          marker.position.set(world.x, world.y, 10); // Aumentato l'asse Z per maggiore sicurezza
           return;
         }
 
-        // MARKER PIÙ GRANDI E VISIBILI
-        const markerSize = 5; // Dimensione aumentata
+  // Marker più piccoli (richiesta utente)
+  const markerSize = 2; // raggio base
 
-        // Crea un nuovo marker usando forme 3D semplici invece di texture
-        const markerGeometry = new THREE.CylinderGeometry(
-          markerSize,
-          markerSize,
-          1,
-          16
-        );
-        const markerMaterial = new THREE.MeshBasicMaterial({ color: color });
+  // Crea un nuovo marker usando forme 3D semplici invece di texture
+  const markerGeometry = new THREE.CylinderGeometry(markerSize, markerSize, 0.8, 20);
+  const markerMaterial = new THREE.MeshBasicMaterial({ color: color });
         const marker = new THREE.Mesh(markerGeometry, markerMaterial);
 
         // Posiziona il marker e assicurati che sia visibile sopra la mappa
-        marker.position.set(constrained.x, constrained.y, 10); // Posizionato più in alto per visibilità
+  marker.position.set(world.x, world.y, 10); // Posizionato più in alto per visibilità
         marker.rotation.x = Math.PI / 2; // Ruota per farlo stare piatto sulla mappa
         marker.userData = { tagId, name: info.name };
 
         // Aggiungi un bordo bianco più spesso per maggiore visibilità
-        const ringGeometry = new THREE.TorusGeometry(markerSize + 1, 1, 8, 24);
-        const ringMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
-        const ring = new THREE.Mesh(ringGeometry, ringMaterial);
-        ring.rotation.x = Math.PI / 2; // Ruota come il marker principale
-        marker.add(ring);
+  // Bordi più discreti: cerchio sottile
+  const ringGeometry = new THREE.TorusGeometry(markerSize + 0.7, 0.4, 8, 24);
+  const ringMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+  ring.rotation.x = Math.PI / 2;
+  marker.add(ring);
+
+        // Amplia l'area di click con un "hit area" trasparente (solo per raycast)
+        try {
+          const hitSize = markerSize * 4; // area di click più grande della grafica
+          const hitGeo = new THREE.CylinderGeometry(hitSize, hitSize, 1, 16);
+          const hitMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.001, depthWrite: false });
+          const hitMesh = new THREE.Mesh(hitGeo, hitMat);
+          hitMesh.rotation.x = Math.PI / 2;
+          hitMesh.userData = { tagId, isHit: true };
+          marker.add(hitMesh);
+        } catch(_) {}
 
         // Aggiungi il marker alla scena e tieni traccia di esso
         tagsRef.current.add(marker);
         tagMarkersRef.current[tagId] = marker;
 
         console.log(
-          `Creato marker per tag ${tagId} a (${constrained.x}, ${constrained.y})`
+          `Creato marker per tag ${tagId} a (${world.x}, ${world.y})`
         );
       } catch (err) {
         console.error(`Errore creazione marker per tag ${tagId}:`, err);
       }
     });
-  }, [tagPositions]);
+    // Rimuovi RAW marker non più presenti
+    Object.keys(rawMarkersRef.current).forEach((tagId) => {
+      if (!debugRawPositions || !debugRawPositions[tagId]) {
+        const r = rawMarkersRef.current[tagId];
+        if (r && tagsRef.current) {
+          tagsRef.current.remove(r);
+          // BoxGeometry/material verranno GC, ma tentiamo dispose
+        }
+        delete rawMarkersRef.current[tagId];
+      }
+    });
+    // Aggiorna o crea RAW markers (debug)
+    if (debugRawPositions) {
+      Object.entries(debugRawPositions).forEach(([tagId, info]) => {
+        try {
+          const world = toWorld(info.x, info.y);
+          if (rawMarkersRef.current[tagId]) {
+            const grp = rawMarkersRef.current[tagId];
+            grp.position.set(world.x, world.y, 12);
+            return;
+          }
+          const arm = 2;
+          const thickness = 0.5;
+          const g1 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
+          const g2 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
+          const mat = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+          const b1 = new THREE.Mesh(g1, mat);
+          const b2 = new THREE.Mesh(g2, mat);
+          b1.rotation.z = Math.PI / 4;
+          b2.rotation.z = -Math.PI / 4;
+          const group = new THREE.Group();
+          group.add(b1);
+          group.add(b2);
+          group.position.set(world.x, world.y, 12);
+          group.userData = { tagId, isRawDebug: true };
+          tagsRef.current.add(group);
+          rawMarkersRef.current[tagId] = group;
+        } catch (err) {
+          console.error(`Errore creazione RAW marker per tag ${tagId}:`, err);
+        }
+      });
+    }
+  }, [tagPositions, debugRawPositions]);
 
   // Carica e visualizza i dati DXF
   useEffect(() => {
@@ -380,6 +554,7 @@ export function DxfViewer({
 
       dxf.entities.forEach((entity) => {
         try {
+          // eslint-disable-next-line default-case
           switch (entity.type) {
             case "LINE": {
               const geometry = new THREE.BufferGeometry();
@@ -518,6 +693,10 @@ export function DxfViewer({
               entitiesCount++;
               break;
             }
+            default: {
+              // Ignora altri tipi di entità non gestiti
+              break;
+            }
           }
         } catch (err) {
           console.warn(`Errore nel processare l'entità ${entity.type}:`, err);
@@ -525,6 +704,20 @@ export function DxfViewer({
       });
 
       if (entitiesCount > 0) {
+        // Calcola fattore di normalizzazione per stabilità rendering
+        const boxSize = new THREE.Vector3();
+        boundingBox.getSize(boxSize);
+        const maxDim = Math.max(boxSize.x, boxSize.y) || 1;
+        const TARGET = 1000; // dimensione target in world units
+  const ns = TARGET / maxDim; // scala tale da portare la dimensione max ~ TARGET
+  normScaleRef.current = ns;
+  try { if (onNormalizationChange) onNormalizationChange(ns); } catch(_) {}
+  // Scala mappa/overlay/ancore e ANCHE il gruppo dei tag per mantenere lo stesso spazio
+  group.scale.set(ns, ns, 1);
+  if (tagsRef.current) tagsRef.current.scale.set(ns, ns, 1);
+  if (anchorsRef.current) anchorsRef.current.scale.set(ns, ns, 1);
+  if (overlayRef.current) overlayRef.current.scale.set(ns, ns, 1);
+
         sceneRef.current.add(group);
         console.log(`Caricate ${entitiesCount} entità dalla mappa DXF`);
 
@@ -535,7 +728,42 @@ export function DxfViewer({
         visualizeMapBounds();
 
         // Centra la vista
-        centerView();
+        // Prova ripristino camera salvata (una sola volta). Se fallisce, centra.
+        if (!restoreAttemptedRef.current) {
+          restoreAttemptedRef.current = true;
+          let restored = false;
+          try {
+            const raw = localStorage.getItem(CAM_STORAGE_KEY);
+            if (raw) {
+              const saved = JSON.parse(raw);
+              if (saved && saved.pos && saved.target) {
+                const b = mapBoundsRef.current;
+                const within = (p) => {
+                  if (!b) return true;
+                  const marginX = (b.max.x - b.min.x) * 2 + 1;
+                  const marginY = (b.max.y - b.min.y) * 2 + 1;
+                  return (
+                    p.x >= b.min.x - marginX && p.x <= b.max.x + marginX &&
+                    p.y >= b.min.y - marginY && p.y <= b.max.y + marginY
+                  );
+                };
+                if (within(saved.pos) && within(saved.target)) {
+                  if (cameraRef.current && controlsRef.current) {
+                    cameraRef.current.position.set(saved.pos.x, saved.pos.y, saved.pos.z);
+                    controlsRef.current.target.set(saved.target.x, saved.target.y, saved.target.z || 0);
+                    cameraRef.current.updateProjectionMatrix();
+                    controlsRef.current.update();
+                    restored = true;
+                    console.log('[DxfViewer] Camera ripristinata da localStorage');
+                  }
+                }
+              }
+            }
+          } catch(e) { console.warn('[DxfViewer] Ripristino camera fallito:', e.message); }
+          if (!restored) centerView();
+        } else {
+          centerView();
+        }
       } else {
         setError("Nessuna entità visualizzabile nel file DXF");
       }
@@ -564,16 +792,15 @@ export function DxfViewer({
       };
 
       // Debug: stampa i confini calcolati
-      console.log("Confini mappa aggiornati:", mapBoundsRef.current);
+  console.log("Confini mappa aggiornati:", mapBoundsRef.current);
+  try { if (onBoundsChange) onBoundsChange({ ...mapBoundsRef.current }); } catch(_) {}
 
-      // Controlla anche i marker esistenti e spostali se necessario
+      // Aggiorna la posizione dei marker se il fattore di normalizzazione cambia (ricalcolo semplice)
+      const ns = normScaleRef.current || 1;
       Object.entries(tagMarkersRef.current).forEach(([tagId, marker]) => {
-        const currentPos = marker.position;
-        const constrained = constrainToMapBounds(currentPos.x, currentPos.y);
-
-        if (currentPos.x !== constrained.x || currentPos.y !== constrained.y) {
-          marker.position.set(constrained.x, constrained.y, currentPos.z);
-        }
+        // Le posizioni originali non le abbiamo salvate qui: assumiamo che la posizione corrente sia già world.
+        // Se volessimo una riconversione accurata dovremmo memorizzare gli x,y raw; per ora niente modifiche.
+        marker.position.z = 10; // assicurati sopra la mappa
       });
     }
   };
@@ -592,7 +819,7 @@ export function DxfViewer({
       }
     });
 
-    // Crea un rettangolo che rappresenta i confini della mappa
+  // Crea un rettangolo che rappresenta i confini della mappa
     const geometry = new THREE.BufferGeometry();
     const vertices = [
       // Rettangolo
@@ -626,17 +853,17 @@ export function DxfViewer({
       linewidth: 2,
     });
 
-    const boundaryLine = new THREE.Line(geometry, material);
+  const boundaryLine = new THREE.Line(geometry, material);
     boundaryLine.userData = { isMapBounds: true };
-    sceneRef.current.add(boundaryLine);
+  if (overlayRef.current) overlayRef.current.add(boundaryLine); else sceneRef.current.add(boundaryLine);
 
     // Opzionale: Aggiungi un indicatore per l'origine (punto in basso a sinistra)
     const originGeometry = new THREE.SphereGeometry(2, 16, 16);
     const originMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
-    const originMarker = new THREE.Mesh(originGeometry, originMaterial);
+  const originMarker = new THREE.Mesh(originGeometry, originMaterial);
     originMarker.position.set(bounds.min.x, bounds.min.y, 1);
     originMarker.userData = { isMapBounds: true, isOrigin: true };
-    sceneRef.current.add(originMarker);
+  if (overlayRef.current) overlayRef.current.add(originMarker); else sceneRef.current.add(originMarker);
 
     console.log("Visualizzazione contorno mappa creata");
   };
@@ -797,6 +1024,43 @@ export function DxfViewer({
   };
 
   // Centra la vista sui contenuti - MIGLIORATO per garantire visibilità
+  const setCameraForBounds = (center, size) => {
+    if (!cameraRef.current || !controlsRef.current) return;
+    const cam = cameraRef.current;
+    const controls = controlsRef.current;
+    const maxDim = Math.max(size.x, size.y) || 1;
+    const diag = Math.sqrt(size.x * size.x + size.y * size.y) || maxDim;
+    const fov = cam.fov * (Math.PI / 180);
+    let distance = maxDim / (2 * Math.tan(fov / 2));
+    distance = Math.max(distance * 1.3, 10);
+    // Far/Near adattivi: mantieni un margine ampio ma non infinito per evitare problemi di precisione
+    const desiredFar = Math.max(5000, diag * 10 + 200);
+    const desiredNear = Math.min(Math.max(0.1, desiredFar / 50000), 5);
+    cam.near = desiredNear;
+    cam.far = desiredFar;
+    cam.updateProjectionMatrix();
+    controls.minDistance = Math.max(5, Math.min(distance * 0.05, 200));
+    controls.maxDistance = desiredFar * 0.95;
+    cam.position.set(center.x, center.y, distance);
+    cam.lookAt(center);
+    controls.target.set(center.x, center.y, 0);
+    controls.update();
+  };
+
+  const adjustFarForMap = () => {
+    if (!cameraRef.current) return;
+    const b = mapBoundsRef.current;
+    if (!b) return;
+    const size = new THREE.Vector3(Math.abs(b.max.x - b.min.x), Math.abs(b.max.y - b.min.y), 0);
+    const diag = Math.sqrt(size.x * size.x + size.y * size.y) || 1;
+    const desiredFar = Math.max(5000, diag * 10 + 200);
+    if (cameraRef.current.far < desiredFar) {
+      cameraRef.current.far = desiredFar;
+      cameraRef.current.updateProjectionMatrix();
+      if (controlsRef.current) controlsRef.current.maxDistance = desiredFar * 0.95;
+    }
+  };
+
   const centerView = () => {
     if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
 
@@ -825,27 +1089,12 @@ export function DxfViewer({
     const size = new THREE.Vector3();
     box.getSize(size);
 
-    // Calcola la distanza per vedere tutto il contenuto
-    const maxDim = Math.max(size.x, size.y);
-    const fov = cameraRef.current.fov * (Math.PI / 180);
-    let distance = maxDim / (2 * Math.tan(fov / 2));
-
-    // Aggiungi un po' di spazio extra
-    distance *= 1.3;
-
-    // Posiziona la camera
-    cameraRef.current.position.set(center.x, center.y, distance);
-    cameraRef.current.lookAt(center);
-    cameraRef.current.updateProjectionMatrix();
-
-    // Aggiorna i controlli
-    controlsRef.current.target.set(center.x, center.y, 0);
-    controlsRef.current.update();
+    setCameraForBounds(center, size);
 
     console.log("Vista centrata con successo:", {
       center: center,
       size: size,
-      distance: distance,
+      distance: cameraRef.current.position.z,
     });
   };
 
@@ -866,6 +1115,48 @@ export function DxfViewer({
     centerView();
   };
 
+  // Centra includendo anche i tag (e marker RAW)
+  const centerIncludingTags = () => {
+    if (!sceneRef.current || !cameraRef.current || !controlsRef.current) return;
+    // 1) Calcola bounding della mappa DXF
+    const mapBox = new THREE.Box3();
+    sceneRef.current.traverse((child) => {
+      if (child.userData && child.userData.isDxf) mapBox.expandByObject(child);
+    });
+    if (mapBox.isEmpty()) {
+      // Nessuna mappa: fallback al centro standard
+      return centerView();
+    }
+    const mapCenter = new THREE.Vector3();
+    const mapSize = new THREE.Vector3();
+    mapBox.getCenter(mapCenter);
+    mapBox.getSize(mapSize);
+    const mapDiag = Math.sqrt(mapSize.x * mapSize.x + mapSize.y * mapSize.y) || 1;
+  const safeRadius = mapDiag * 3; // ignora outlier molto lontani
+
+    // 2) Costruisci bounding combinato: mappa + tag entro raggio sicuro
+    const box = mapBox.clone();
+    if (tagsRef.current) {
+      const tmpBox = new THREE.Box3();
+      tagsRef.current.children.forEach((c) => {
+        tmpBox.setFromObject(c);
+        const childCenter = new THREE.Vector3();
+        tmpBox.getCenter(childCenter);
+        if (childCenter.distanceTo(mapCenter) <= safeRadius) {
+          box.union(tmpBox);
+        }
+      });
+    }
+    if (box.isEmpty()) return centerView();
+
+    // 3) Posiziona la camera con distanza clampata e far plane adeguato
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    box.getCenter(center);
+    box.getSize(size);
+    setCameraForBounds(center, size);
+  };
+
   // Stili per il container
   const containerStyle = {
     width,
@@ -875,6 +1166,41 @@ export function DxfViewer({
     borderRadius: "4px",
     overflow: "hidden",
   };
+
+  // Focus esterno: centra la vista su un punto mantenendo lo zoom attuale
+  useEffect(() => {
+    if (!focusPoint || !controlsRef.current || !cameraRef.current) return;
+    try {
+      const target = new THREE.Vector3(Number(focusPoint.x) || 0, Number(focusPoint.y) || 0, 0);
+      const cam = cameraRef.current;
+      const controls = controlsRef.current;
+      // Evita di seguire target fuori dai confini (con un margine): se fuori, ignora
+      const b = mapBoundsRef.current;
+      if (b) {
+        const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+        const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+        const marginX = sizeX * 0.15; // 15% margine
+        const marginY = sizeY * 0.15;
+        const within = (p) => (
+          p.x >= (b.min.x - marginX) && p.x <= (b.max.x + marginX) &&
+          p.y >= (b.min.y - marginY) && p.y <= (b.max.y + marginY)
+        );
+        if (!within(target)) {
+          // Non spostare la camera fuori dalla planimetria
+          return;
+        }
+      }
+      // Pan verso il target mantenendo lo zoom
+      const prevTarget = controls.target.clone();
+      const camOffset = cam.position.clone().sub(prevTarget);
+      controls.target.copy(target);
+      cam.position.copy(target.clone().add(camOffset));
+      cam.lookAt(target);
+      cam.updateProjectionMatrix();
+      controls.update();
+      adjustFarForMap();
+    } catch(_) {}
+  }, [focusPoint]);
 
   return (
     <div style={containerStyle} ref={containerRef}>
@@ -962,6 +1288,20 @@ export function DxfViewer({
           </svg>
         </button>
         <button
+          onClick={centerIncludingTags}
+          className="bg-gray-200 hover:bg-gray-300 p-1 rounded"
+          title="Centra Mappa + Tag"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-5 w-5"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+          >
+            <path d="M4 4h4v2H6v2H4V4zm12 0v4h-2V6h-2V4h4zM4 16v-4h2v2h2v2H4zm12 0h-4v-2h2v-2h2v4z" />
+          </svg>
+        </button>
+        <button
           onClick={zoomReset}
           className="bg-gray-200 hover:bg-gray-300 p-1 rounded"
           title="Centra Planimetria"
@@ -993,6 +1333,71 @@ export function DxfViewer({
         Origine: ({Math.round(mapBoundsRef.current.min.x)},{" "}
         {Math.round(mapBoundsRef.current.min.y)})
       </div>
+      {hoverTagId && tagPositions[hoverTagId] && (
+        (() => {
+          const info = tagPositions[hoverTagId];
+          const toHex = (id) => {
+            const s = String(id ?? '');
+            const hexLike = s.replace(/[^0-9A-Fa-f]/g,'');
+            if (/^[0-9A-Fa-f]{8,}$/.test(hexLike)) return '0x' + hexLike.toUpperCase();
+            const num = Number(s);
+            if (!Number.isNaN(num)) return '0x' + (num >>> 0).toString(16).toUpperCase().padStart(8,'0');
+            return s;
+          };
+          const hexId = toHex(hoverTagId);
+          return (
+        <div className="absolute top-2 left-2 bg-white bg-opacity-95 shadow-lg rounded-md px-3 py-2 z-30 text-xs max-w-xs cursor-pointer"
+             onClick={() => { try { onTagClick && onTagClick(hoverTagId); } catch(_) {} }}
+        >
+          <div className="font-semibold mb-1">{info.name || `Tag ${hexId}`}</div>
+          <div>ID: {hexId}</div>
+          <div>Pos: {info.x.toFixed(2)}, {info.y.toFixed(2)}</div>
+          {typeof info.cap !== 'undefined' && (
+            <div>Batteria: {info.cap}%</div>
+          )}
+          {typeof info.bcharge !== 'undefined' && (
+            <div>Charging: {info.bcharge ? 'Yes' : 'No'}</div>
+          )}
+          <div>Age: {Math.round(info.ageMs || (Date.now() - info.ts))}ms</div>
+          <div className="mt-1 text-[10px] text-gray-500">Click per fissare nel pannello dettagli</div>
+        </div>
+          );
+        })()
+      )}
+      {/* Debug overlay nomi/varianti (attivabile impostando window.__DXF_DEBUG_NAMES = true) */}
+      {typeof window !== 'undefined' && window.__DXF_DEBUG_NAMES && (
+        <div className="absolute top-2 right-2 max-h-64 overflow-auto bg-white bg-opacity-90 text-[10px] p-2 rounded shadow z-30 w-56">
+          <div className="font-semibold mb-1">Debug Tag Names</div>
+          {Object.entries(tagPositions).map(([tid, info]) => {
+            const variants = [];
+            const s = String(tid);
+            variants.push(s);
+            const num = Number(s);
+            if (!Number.isNaN(num)) {
+              const u32 = (num >>> 0);
+              variants.push(String(u32));
+              variants.push(num.toString(16).toUpperCase());
+              variants.push(u32.toString(16).toUpperCase());
+            }
+            const hexLike = s.replace(/[^0-9A-Fa-f]/g,'');
+            if (/^[0-9A-Fa-f]{8,}$/.test(hexLike)) {
+              const up = hexLike.toUpperCase();
+              variants.push(up);
+              const lowHex = up.slice(-8);
+              variants.push(lowHex);
+              try { variants.push(String(parseInt(lowHex,16))); } catch(_) {}
+            }
+            const uniq = Array.from(new Set(variants));
+            return (
+              <div key={tid} className="mb-1 border-b border-gray-200 pb-1">
+                <div className="font-medium">{info.name || `Tag ${tid}`}</div>
+                <div className="truncate">ID: {tid}</div>
+                <div className="truncate">Varianti: {uniq.join(' | ')}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

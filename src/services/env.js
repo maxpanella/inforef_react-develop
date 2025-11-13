@@ -17,7 +17,8 @@
 // });
 
 export const env = {
-  useMock: process.env.REACT_APP_USE_MOCK_DATA === "false",
+  // true solo se REACT_APP_USE_MOCK_DATA === 'true'
+  useMock: String(process.env.REACT_APP_USE_MOCK_DATA || 'false').toLowerCase() === 'true',
   companyId: process.env.REACT_APP_COMPANY_ID || "1",
   companyName: process.env.REACT_APP_COMPANY_NAME || "Impresa Demo",
   adminUser: process.env.REACT_APP_ADMIN_USERNAME || "admin@example.com",
@@ -25,8 +26,7 @@ export const env = {
     process.env.REACT_APP_ADMIN_PASSWORD_HASH ||
     "5f4dcc3b5aa765d61d8327deb882cf99",
   crmUrl:
-    process.env.REACT_APP_CRM_BASE_URL || "https://apidemobo01.sgslweb.com",
-  backendUrl: process.env.REACT_APP_BACKEND_URL || "http://localhost:4000",
+    process.env.REACT_APP_CRM_BASE_URL || "http://192.168.15.81:8080/SicurwebApi",  backendUrl: process.env.REACT_APP_BACKEND_URL || "http://localhost:4000",
   blueiotHost: process.env.REACT_APP_BLUEIOT_HOST || "ws://192.168.1.11:48300",
   blueiotUsername: process.env.REACT_APP_BLUEIOT_USERNAME || "admin",
   blueiotPassword: process.env.REACT_APP_BLUEIOT_PASSWORD || "#BlueIOT",

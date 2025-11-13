@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { BlueiotClient } from "../services/blueiotClient";
+import { LocalsenseClient } from "../services/localsenseClient";
 
 const ConnectionStatus = () => {
   const [status, setStatus] = useState("disconnected");
@@ -8,6 +8,14 @@ const ConnectionStatus = () => {
 
   // Aggiungi un flag per tenere traccia dei tentativi di riconnessione
   const [isReconnecting, setIsReconnecting] = useState(false);
+  // Diagnostica periodica dal client BlueIOT
+  const [diag, setDiag] = useState({
+    isConnected: false,
+    frameCounters: { bin: 0, txt: 0 },
+    lastCloseCode: null,
+    consecutive1006: 0,
+    positionsEverReceived: false,
+  });
 
   // Usa questo useEffect per gestire la connessione e gli eventi
   useEffect(() => {
@@ -26,22 +34,44 @@ const ConnectionStatus = () => {
       setIsReconnecting(false);
     };
 
-    const handleClose = () => {
-      console.log("ConnectionStatus: connessione chiusa");
+    const handleClose = (info) => {
+      console.log("ConnectionStatus: connessione chiusa", info);
       setStatus("disconnected");
+      try {
+        if (info && (info.code || info.durationMs)) {
+          setLastError(`close code: ${info.code ?? 'n/a'}, duration: ${info.durationMs ?? 'n/a'}ms`);
+        }
+      } catch {}
       setIsReconnecting(false);
     };
 
-    // Registra i listener
-    BlueiotClient.on("open", handleOpen);
-    BlueiotClient.on("error", handleError);
-    BlueiotClient.on("close", handleClose);
+    // Registra i listener (non richiamiamo connect qui per evitare doppia inizializzazione)
+    LocalsenseClient.on("open", handleOpen);
+    LocalsenseClient.on("error", handleError);
+    LocalsenseClient.on("close", handleClose);
+
+    // Poll diagnostica ogni 2s
+    const intId = setInterval(() => {
+      try {
+        const d = LocalsenseClient.getDiagnostics?.();
+        if (d) {
+          setDiag(d);
+          // Se la diagnostica dice connesso, sincronizza lo status mostrato
+          if (d.isConnected && !isReconnecting) {
+            setStatus('connected');
+          } else if (!d.isConnected && status === 'connected') {
+            setStatus('disconnected');
+          }
+        }
+      } catch {}
+    }, 2000);
 
     // Cleanup
     return () => {
-      BlueiotClient.off("open", handleOpen);
-      BlueiotClient.off("error", handleError);
-      BlueiotClient.off("close", handleClose);
+  LocalsenseClient.off("open", handleOpen);
+  LocalsenseClient.off("error", handleError);
+  LocalsenseClient.off("close", handleClose);
+      clearInterval(intId);
     };
   }, []);
 
@@ -51,18 +81,18 @@ const ConnectionStatus = () => {
     setIsReconnecting(true);
 
     // Assicurati di disconnetterti prima di riconnetterti
-    BlueiotClient.disconnect();
+    LocalsenseClient.disconnect();
 
     // Aggiungi un piccolo ritardo per garantire che la disconnessione sia completata
     setTimeout(() => {
-      BlueiotClient.connect();
+      LocalsenseClient.connect();
     }, 500);
   };
 
   // Funzione per disconnettersi
   const handleDisconnect = () => {
-    console.log("Disconnessione da BlueIOT...");
-    BlueiotClient.disconnect();
+    console.log("Disconnessione da BlueIOT (stream off)...");
+    LocalsenseClient.disconnect();
   };
 
   const getStatusColor = () => {
@@ -141,6 +171,77 @@ const ConnectionStatus = () => {
             >
               Riconnetti
             </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.openControlNow?.(); }}
+            >
+              Apri Control
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.forcePositionSwitch?.(); }}
+            >
+              Forza switch pos
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.subscribeMapsNow?.(); }}
+            >
+              Subscrivi mappe
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.setFiltersEnabled?.(false); }}
+            >
+              Filtri pos OFF
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.setFiltersEnabled?.(true); }}
+            >
+              Filtri pos ON
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.setTagId64?.(true); }}
+            >
+              ID 64-bit
+            </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => { e.stopPropagation(); LocalsenseClient.setTagId64?.(false); }}
+            >
+              ID 32-bit
+            </button>
+            <div className="col-span-2 text-[11px] leading-tight bg-white/90 text-gray-800 rounded p-2">
+              <div className="font-semibold">Diagnostica BlueIOT</div>
+              <div>Frames: BIN {diag.frameCounters?.bin ?? 0} / TXT {diag.frameCounters?.txt ?? 0}</div>
+              <div>Positions ever: {diag.positionsEverReceived ? 'sì' : 'no'}</div>
+              <div>Control: {diag.controlOpened ? 'aperto' : (diag.controlRequested ? 'richiesto' : 'non richiesto')}</div>
+              <div>Switch attempts: {diag.switchAttempts ?? 0}</div>
+              {diag.lastSwitchResult && (
+                <div>Last switch result: <span className="font-mono break-all">{String(diag.lastSwitchResult)}</span></div>
+              )}
+              <div className="mt-1">Proto: {diag.runtime?.proto} | Salted: {diag.runtime?.forceUnsalted ? 'no' : 'sì'}</div>
+              <div>Filtri pos: {diag.runtime?.filtersEnabled ? 'ON' : 'OFF'}{typeof diag.runtime?.safeAbs !== 'undefined' ? ` (SAFE_ABS=${diag.runtime.safeAbs}m)` : ''}</div>
+              {diag.frameTypeCounts && (
+                <div className="mt-1">Frame types: {Object.entries(diag.frameTypeCounts).map(([k,v]) => `${k}=${v}`).join(' ')}</div>
+              )}
+              {diag.posDiag && (
+                <div className="mt-1">
+                  POS diag: jsonFrames {diag.posDiag.jsonFrames ?? 0} / binFrames {diag.posDiag.binFrames ?? 0} | accepted {diag.posDiag.accepted ?? 0} | droppedTooBig {diag.posDiag.droppedTooBig ?? 0} | droppedNaN {diag.posDiag.droppedNaN ?? 0}
+                </div>
+              )}
+              {typeof diag.lastCloseCode !== 'undefined' && diag.lastCloseCode !== null && (
+                <div>Last close code: {String(diag.lastCloseCode)}</div>
+              )}
+              {diag.consecutive1006 > 0 && (
+                <div>1006 repeats: {diag.consecutive1006}</div>
+              )}
+              {!diag.positionsEverReceived && (diag.frameCounters?.bin || 0) > 0 && (
+                <div className="mt-1 text-amber-600">Ricevo frame binari (es. PERSON_INFO) ma nessuna posizione (TAG_POS). Abilita lo stream "position/XY" sul gateway o libera il canale Control.</div>
+              )}
+            </div>
           </div>
         )}
       </div>
