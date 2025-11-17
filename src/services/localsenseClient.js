@@ -1,4 +1,5 @@
 /* Wrapper BlueIOT */
+import { setRollcallMap, canonicalizeId } from './tagCanonicalizer';
 const WS_URL = process.env.REACT_APP_BLUEIOT_WS_URL || "ws://192.168.1.11:48300";
 const USER = process.env.REACT_APP_BLUEIOT_USERNAME || "admin";
 // Default to vendor's documented password if env is missing, to avoid silent auth failures
@@ -46,7 +47,9 @@ let posDiag = {
   droppedTooBig: 0,
   droppedNaN: 0,
   lastSample: null,
+  lastFlags: null, // { isGlobal, isGeo }
 };
+let currentPosOutType = "XY";
 
 function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
@@ -96,8 +99,35 @@ async function ensureLoaded() {
 
 const listeners = { position: [], battery: [], open: [], close: [], error: [], vibrate: [] };
 let lastOpenAt = 0;
+// Lightweight in-memory event buffer for diagnostics (accessible from console via window.__BLUEIOT_EVENT_LOG)
+const __EVENT_LOG = (() => { try { if (typeof window !== 'undefined') { window.__BLUEIOT_EVENT_LOG = window.__BLUEIOT_EVENT_LOG || []; return window.__BLUEIOT_EVENT_LOG; } return []; } catch (_) { return []; } })();
+function pushEvent(type, data) {
+  try {
+    __EVENT_LOG.push({ t: Date.now(), type, data });
+    if (__EVENT_LOG.length > 500) __EVENT_LOG.shift();
+  } catch (_) {}
+}
+const LOG_THROTTLE_MS = 300;
+let __lastLog = 0;
+function dbg(...args) {
+  try {
+    const now = Date.now();
+    if (now - __lastLog > LOG_THROTTLE_MS) {
+      // Keep these as debug-level to avoid polluting normal console, but they will show when the user wants
+      console.debug('[BlueIot]', ...args);
+      __lastLog = now;
+    }
+    __EVENT_LOG.push({ t: Date.now(), type: 'dbg', msg: args });
+    if (__EVENT_LOG.length > 500) __EVENT_LOG.shift();
+  } catch (_) {}
+}
 function emit(event, payload) {
   (listeners[event] || []).forEach(cb => { try { cb(payload); } catch (e) {} });
+  try {
+    // Simple payload summary to keep event log small
+    const summary = (payload && typeof payload === 'object') ? (Array.isArray(payload) ? { len: payload.length } : { keys: Object.keys(payload).length }) : { type: typeof payload };
+    pushEvent('emit', { event, summary });
+  } catch (_) {}
 }
 export function on(event, cb) {
   if (!listeners[event]) listeners[event] = [];
@@ -148,6 +178,8 @@ function bindGlobalRwsEventsOnce() {
 export const LocalsenseClient = {
   on,
   off,
+  // Allow external code to seed a rollcall -> variants mapping (helps canonicalization)
+  setRollcallMapping: (m) => { try { setRollcallMap(m); } catch(_) {} },
   async connect() {
     try {
       const api = await ensureLoaded();
@@ -158,8 +190,17 @@ export const LocalsenseClient = {
   // Always set credentials so we don't accidentally reuse wrong state
   api.SetAccount?.(USER, PASS, effectiveSalt);
   // La maggior parte delle installazioni usa tagid a 32-bit sui frame XY: mantieni 32-bit per allineare il parsing
-  api.setTag64CheckedFlag?.(false);
-  api.setTag64Show?.(false);
+  // Allow enabling 64-bit tag IDs via env (default true for better name alignment)
+  const TAG64_ENABLE = String(process.env.REACT_APP_BLUEIOT_TAG64_ENABLE || 'true').toLowerCase() === 'true';
+  try { api.setTag64CheckedFlag?.(!!TAG64_ENABLE); } catch {}
+  try { api.setTag64Show?.(false); } catch {}
+
+      // Diagnostic accessor for quick inspection from console
+      try {
+        if (typeof window !== 'undefined') {
+          window.getBlueIotDiag = () => ({ posDiag, positionsEverReceived, frameCounters, lastJsonScaleRefLocal, latestBaseDiv, runtimeFiltersEnabled });
+        }
+      } catch (_) {}
 
       let lastJsonTs = 0;
       const handlePosJson = (posMap) => {
@@ -201,9 +242,16 @@ export const LocalsenseClient = {
           }
           return; // asynchronous re-entry
         }
+        // Debug capture (bounded <=50) of raw TAG_POS frames
+        try {
+          window.__BLUEIOT_RAW_FRAMES = window.__BLUEIOT_RAW_FRAMES || { TAG_POS: [], PERSON_INFO: [], ROLLCALL_DATA: [] };
+          const __buf = window.__BLUEIOT_RAW_FRAMES.TAG_POS; __buf.push(posMap); if (__buf.length > 50) __buf.shift();
+        } catch(_) {}
+        try { pushEvent('rawTAG_POS', { ts: Date.now(), sample: (posMap && Object.keys(posMap || {}).length) || 0 }); } catch(_) {}
         posDiag.jsonFrames += 1;
   const SAFE_ABS = SAFE_ABS_POS; // metri: scarta coordinate implausibili
-        const arr = Object.values(posMap || {}).map(p => {
+  const perPosNameMap = {}; // raccoglie eventuali nomi per-tag presenti dentro ogni entry
+  const arr = Object.entries(posMap || {}).map(([key, p]) => {
           // Le coordinate JSON della SDK risultano già in metri (es. 0.27, 6.11)
           const xRaw = Number(p.x ?? 0);
           const yRaw = Number(p.y ?? 0);
@@ -212,29 +260,160 @@ export const LocalsenseClient = {
             posDiag.droppedNaN += 1;
             return null; // scarta non numerici
           }
+          // Se stiamo lavorando in XY e il frame è GEO/GLOBAL, ignora per evitare unità errate in mappa
+          const isGlobal = !!p.isGlobalGraphicCoord;
+          const isGeo = !!p.isGeoGraphicCoord;
+          if (currentPosOutType === 'XY' && (isGlobal || isGeo)) {
+            // accetta solo XY puro in modo XY
+            return null;
+          }
           if (runtimeFiltersEnabled && (Math.abs(xRaw) > SAFE_ABS || Math.abs(yRaw) > SAFE_ABS)) {
             posDiag.droppedTooBig += 1;
             return null; // filtra outlier hard
           }
+          // ID handling: keep primary id as string (often 32-bit decimal), carry optional hex for 64-bit safety
+          let idPrimary = String(p.id ?? p.tagid ?? "");
+          const rawHex = p.tag_id_hex || p.tag_hex || p.mac || p.macaddr || null;
+          let idHex = rawHex ? String(rawHex).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() : undefined;
+          // Fallback: if primary id already looks hex, use it as idHex too
+          if (!idHex && /^[0-9A-Fa-f]+$/.test(idPrimary)) {
+            idHex = idPrimary.toUpperCase();
+          }
+          // Preserve key as hex id if it looks like one (when payload is a map keyed by hex tag id)
+          if (!idHex && typeof key === 'string' && /^[0-9A-Fa-f]{6,}$/.test(key)) {
+            idHex = key.toUpperCase();
+          }
+          // If primary id missing/short and we have a hex key, derive a stable low32 decimal for UI/back-compat
+          if ((!idPrimary || idPrimary === '0') && idHex && idHex.length >= 8) {
+            try { idPrimary = String(parseInt(idHex.slice(-8), 16)); } catch(_) {}
+          }
+          // If idHex still missing but idPrimary is numeric, compute low32 hex (8 chars) to improve matching downstream
+          if (!idHex) {
+            const n = Number(idPrimary);
+            if (!Number.isNaN(n)) {
+              try { idHex = (n >>> 0).toString(16).toUpperCase().padStart(8, '0'); } catch(_) {}
+            }
+          }
+          // If this entry carries a candidate name (per-tag), collect it for emission
+          try {
+            const candName = p.tag_name || p.name || p.alias || p.tagAlias;
+            if (typeof candName === 'string' && candName.trim()) {
+              // Prefer hex when available; fallback to primary id
+              const keyId = idHex || idPrimary;
+              if (keyId) addNameForIdVariants(perPosNameMap, keyId, candName);
+            }
+          } catch(_) {}
           return ({
-            id: String(p.id ?? p.tagid ?? ""),
+            id: idPrimary,
+            idHex,
             x: xRaw,
             y: yRaw,
             z: zRaw,
             cap: p.cap,
             regid: p.regid,
             ts: Date.now(),
+            isGlobal,
+            isGeo,
+            src: 'json'
           });
         }).filter(Boolean);
         if (arr.length) {
-          console.log('[BlueIot] Positions received:', arr.length, 'sample:', arr[0]);
-          emit("position", arr);
-          posDiag.accepted += arr.length;
-          posDiag.lastSample = arr[0];
-          positionsEverReceived = true;
-          if (!firstPositionAt) firstPositionAt = Date.now();
-          lastJsonTs = Date.now();
+          // Per-frame consistency check: confronta id decimale con idHex/low32
+          try {
+            arr.forEach(p => {
+              try {
+                const pid = String(p.id ?? '');
+                const hx = p.idHex ? String(p.idHex).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() : null;
+                if (hx && hx.length >= 8) {
+                  const low32 = String(parseInt(hx.slice(-8), 16) >>> 0);
+                  if (pid && pid !== low32) {
+                    pushEvent('idVariantMismatch', { src: 'json', id: pid, idHex: hx, low32, sample: p });
+                    dbg('[BlueIot][CHECK] id mismatch json:', pid, 'vs low32(hex)', low32);
+                  }
+                }
+              } catch(_) {}
+            });
+          } catch(_) {}
+          // Canonicalize IDs so downstream consumers see a single stable ID form
+          try {
+            arr.forEach(p => {
+              try {
+                const preferred = p.idHex || p.id || p.tag_id || p.tagid;
+                const canon = canonicalizeId(preferred ?? p.id);
+                if (canon) {
+                  p.idRaw = String(p.id);
+                  p.id = String(canon);
+                } else {
+                  p.id = String(p.id);
+                }
+              } catch(_) { /* ignore per-entry */ }
+            });
+          } catch(_) {}
+          try { if (typeof window !== 'undefined' && window.__BLUEIOT_VERBOSE) console.log('[BlueIot] Positions received:', arr.length, 'sample:', arr[0]); } catch(_) {}
+          // Sanitize positions: drop entries with non-finite or extreme coordinates to avoid breaking the viewer camera
+          try {
+            const SAFE_ABS = 1e5; // coordinates above this magnitude are considered invalid
+            const before = arr.length;
+            const filteredArr = arr.filter(p => {
+              const ok = Number.isFinite(p.x) && Number.isFinite(p.y) && Math.abs(p.x) <= SAFE_ABS && Math.abs(p.y) <= SAFE_ABS;
+              if (!ok) {
+                posDiag.droppedInvalid = (posDiag.droppedInvalid || 0) + 1;
+                try { pushEvent('positionDroppedInvalid', { sample: p }); } catch(_) {}
+              }
+              return ok;
+            });
+            if (filteredArr.length !== before) console.warn('[BlueIot] Some positions dropped for being invalid or too large', before - filteredArr.length);
+            // diagnostica magnitudine media (per confronto con BIN)
+            try {
+              const avgMag = filteredArr.reduce((acc,p)=>acc+Math.hypot(p.x,p.y),0)/(filteredArr.length||1);
+              window.__BLUEIOT_SCALE_DIAG = window.__BLUEIOT_SCALE_DIAG || {};
+              window.__BLUEIOT_SCALE_DIAG.json = { lastJsonScaleRef: avgMag };
+              window.__BLUEIOT_LAST_JSON_MAG = avgMag;
+            } catch(_) {}
+            emit("position", filteredArr);
+            try { pushEvent('positionEmitted', { count: filteredArr.length, sample: filteredArr[0] }); } catch(_) {}
+            posDiag.accepted += filteredArr.length;
+            posDiag.lastSample = filteredArr[0];
+            // salva ultime flag di coordinata per diagnostica
+            try { posDiag.lastFlags = { isGlobal: !!filteredArr[0]?.isGlobal, isGeo: !!filteredArr[0]?.isGeo }; } catch {}
+            positionsEverReceived = true;
+            if (!firstPositionAt) firstPositionAt = Date.now();
+            lastJsonTs = Date.now();
+          } catch(_) {}
         }
+        // Emit per-entry names if discovered (canonicalize keys)
+        try {
+          if (Object.keys(perPosNameMap).length) {
+            const canonMap = {};
+            Object.entries(perPosNameMap).forEach(([k, v]) => {
+              try { const c = canonicalizeId(k); canonMap[c] = canonMap[c] || v; } catch(_) { canonMap[k] = canonMap[k] || v; }
+            });
+            emit('tagNames', canonMap);
+          }
+        } catch(_) {}
+        // Se il payload JSON contiene anche una mappa di nomi (es. tag_name: { "33109": "Mario" }) propaga subito i nomi
+        // Normalizza le chiavi: genera varianti (hex normalizzato senza separatori, low32 dec) per allineare ai formati degli ID in posizione
+        try {
+          const tn = posMap && posMap.tag_name;
+          if (tn && typeof tn === 'object' && !Array.isArray(tn)) {
+            const map = {};
+            Object.entries(tn).forEach(([k, v]) => {
+              if (typeof v === 'string' && v.trim()) {
+                // Usa lo stesso normalizzatore usato altrove per creare tutte le varianti utili (dec, HEX normalizzato, low32)
+                try { addNameForIdVariants(map, k, v); } catch(_) { /* fallback grezzo se qualcosa va storto */ map[String(k)] = v.trim(); }
+              }
+            });
+            if (Object.keys(map).length) {
+              // canonicalize keys
+              const canonMap = {};
+              Object.entries(map).forEach(([k,v]) => {
+                try { const c = canonicalizeId(k); canonMap[c] = canonMap[c] || v; } catch(_) { canonMap[k] = canonMap[k] || v; }
+              });
+              try { pushEvent('tagNames', { count: Object.keys(canonMap).length }); } catch(_) {}
+              emit('tagNames', canonMap);
+            }
+          }
+        } catch(_) {}
         // Heuristica: se stiamo scartando solo per 'tooBig' e non abbiamo ancora accettato nulla, spegni automaticamente i filtri
         if (runtimeFiltersEnabled && posDiag.accepted === 0 && posDiag.droppedTooBig >= 10) {
           runtimeFiltersEnabled = false;
@@ -243,21 +422,93 @@ export const LocalsenseClient = {
       };
       // Helper: produce multiple ID variants for mapping (decimal, hex, low32-from-hex)
       const collectIdVariants = (obj) => {
-        const out = [];
-        const add = (v) => { if (v !== null && typeof v !== 'undefined') out.push(String(v)); };
-        // Common numeric/string fields
-        add(obj?.tag_id); add(obj?.id); add(obj?.tagid); add(obj?.tagid32); add(obj?.tag_id_32);
-        // Hex-like fields (strip separators)
-        const hexCand = (obj && (obj.tag_id_hex || obj.tag_id || obj.tagid_hex || obj.mac || obj.macaddr));
-        if (hexCand && typeof hexCand === 'string') {
-          const norm = hexCand.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
-          if (norm) out.push(norm);
-          if (norm.length >= 8) {
-            const low = norm.slice(-8);
-            try { out.push(String(parseInt(low, 16))); } catch(_) {}
+          const out = [];
+          const add = (v) => { if (v !== null && typeof v !== 'undefined') out.push(String(v)); };
+          // Common numeric/string fields
+          add(obj?.tag_id); add(obj?.id); add(obj?.tagid); add(obj?.tagid32); add(obj?.tag_id_32);
+          // Hex-like fields (strip separators) or explicit hex sources
+          const hexCand = (obj && (obj.tag_id_hex || obj.tag_id || obj.tagid_hex || obj.mac || obj.macaddr));
+          if (hexCand && typeof hexCand === 'string') {
+            const norm = hexCand.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+            if (norm) out.push(norm);
+            if (norm.length >= 8) {
+              const low = norm.slice(-8);
+              try { out.push(String(parseInt(low, 16))); } catch(_) {}
+            }
           }
-        }
-        return Array.from(new Set(out.filter(Boolean)));
+          // Derive hex (low32) variant for purely numeric IDs so UI/idHex matching works even if SDK only emits decimal
+          try {
+            out.filter(v => /^[0-9]+$/.test(v)).forEach(nStr => {
+              const n = Number(nStr);
+              if (Number.isFinite(n)) {
+                const hex = (n >>> 0).toString(16).toUpperCase().padStart(8, '0');
+                if (!out.includes(hex)) out.push(hex);
+              }
+            });
+          } catch(_) {}
+          return Array.from(new Set(out.filter(Boolean)));
+      };
+      // Helper: add name for all ID variants derived from a single id string (dec or hex)
+      const addNameForIdVariants = (acc, idStr, name) => {
+        try {
+          if (!idStr || !name) return;
+          const s = String(idStr);
+          const obj = {};
+          // Ambiguità: stringhe solo numeriche (anche molto lunghe) vanno trattate come decimali, non come hex.
+          // Considera "hex-like" solo se contiene lettere A-F/a-f, separatori (: -) o prefisso 0x.
+          const hasHexLetter = /[A-Fa-f]/.test(s);
+          const hasSepOrPrefix = s.includes(':') || s.includes('-') || s.startsWith('0x') || s.startsWith('0X');
+          if (hasHexLetter || hasSepOrPrefix) obj.tag_id_hex = s; else obj.id = s;
+          const vars = collectIdVariants(obj) || [];
+          const nm = cleanTagName(String(name));
+          if (!nm) return;
+          vars.forEach(v => { acc[v] = nm; });
+        } catch(_) {}
+      };
+      // Generic deep extractor for names attached to tag IDs in arbitrary payloads
+      const extractNamesDeep = (node, acc) => {
+        try {
+          if (!node || typeof node !== 'object') return;
+          if (Array.isArray(node)) { node.forEach(n => extractNamesDeep(n, acc)); return; }
+          // At this level, look for id fields and candidate name fields
+          const variants = collectIdVariants(node);
+          if (variants && variants.length) {
+            // candidate name fields (vendor variants)
+            const cand = node.tag_name || node.name || node.alias || node.tagAlias || node.tagName || node.tagname || node.nick || node.label || node.text;
+            const nm = cleanTagName(cand || '');
+            if (nm) variants.forEach(v => { acc[v] = nm; });
+          }
+          // Special-case: node.tag_name may be an object like { "33109": "Braccialetto Test n1" }
+          if (node.tag_name && typeof node.tag_name === 'object' && !Array.isArray(node.tag_name)) {
+            Object.entries(node.tag_name).forEach(([k, v]) => {
+              if (typeof v === 'string') addNameForIdVariants(acc, k, v);
+            });
+          }
+          // Generic map case: object whose keys look like IDs and values are strings
+          // Safeguard: only if it has a small number of entries or majority of values are short strings
+          const entries = Object.entries(node);
+          if (entries.length > 0) {
+            let stringCount = 0, idLikeCount = 0;
+            for (let i=0;i<Math.min(entries.length, 10);i++) {
+              const [k, v] = entries[i];
+              const idLike = /^[0-9]+$/.test(k) || /^[0-9A-Fa-f]{6,}$/.test(k);
+              if (idLike) idLikeCount++;
+              if (typeof v === 'string' && v.length <= 128) stringCount++;
+            }
+            if (idLikeCount >= 2 && stringCount >= 2) {
+              entries.forEach(([k, v]) => {
+                if ((/^[0-9]+$/.test(k) || /^[0-9A-Fa-f]{6,}$/.test(k)) && typeof v === 'string') {
+                  addNameForIdVariants(acc, k, v);
+                }
+              });
+            }
+          }
+          // Recurse into known nested containers
+          Object.keys(node).forEach(k => {
+            const v = node[k];
+            if (v && typeof v === 'object') extractNamesDeep(v, acc);
+          });
+        } catch(_) {}
       };
       const handlePersonInfo = (info) => {
         // Normalizza possibili formati (JSON string / Blob)
@@ -272,6 +523,13 @@ export const LocalsenseClient = {
         try {
           const tagIds = [];
           const nameMap = {};
+          // Conserva payload grezzo per ispezione da console
+          try { window.__BLUEIOT_LAST_PERSON = info; } catch(_) {}
+          // Debug capture (bounded <=50) of raw PERSON_INFO frames
+          try {
+            window.__BLUEIOT_RAW_FRAMES = window.__BLUEIOT_RAW_FRAMES || { TAG_POS: [], PERSON_INFO: [], ROLLCALL_DATA: [] };
+            const __pbuf = window.__BLUEIOT_RAW_FRAMES.PERSON_INFO; __pbuf.push(info); if (__pbuf.length > 50) __pbuf.shift();
+          } catch(_) {}
           // Nota: campi ID alternativi gestiti da collectIdVariants
           if (info && info.map_infos) {
             Object.values(info.map_infos).forEach(m => {
@@ -279,7 +537,7 @@ export const LocalsenseClient = {
                 const variants = collectIdVariants(t);
                 if (!variants.length) return;
                 variants.forEach(v => tagIds.push(v));
-                const candidate = t.tag_name || null;
+                const candidate = t.tag_name || t.name || t.alias;
                 if (candidate) {
                   const nm = cleanTagName(candidate);
                   if (nm) variants.forEach(v => { nameMap[v] = nm; });
@@ -302,9 +560,196 @@ export const LocalsenseClient = {
               }
             } catch(e) { console.warn('[BlueIot][Auto] map subscribe failed:', e?.message); }
           }
-          if (tagIds.length) { emit('tagsOnline', { tagIds, raw: info }); }
-          if (Object.keys(nameMap).length) { emit('tagNames', nameMap); }
+          // Deep fallback: scan entire object for id+name pairs
+          extractNamesDeep(info, nameMap);
+          // Esponi derivazioni per aiuto debug (tag -> varianti)
+          try {
+            const tagVariantPreview = {};
+            if (info && info.map_infos) {
+              Object.values(info.map_infos).forEach(m => {
+                (m.tags || []).forEach(t => {
+                  const vars = collectIdVariants(t);
+                  if (vars && vars.length) tagVariantPreview[(t.tag_id||t.id||vars[0])] = vars;
+                });
+              });
+            }
+            window.__BLUEIOT_PERSON_TAGS = tagVariantPreview;
+            console.log('[BlueIot][DBG] PERSON_INFO variants:', tagVariantPreview);
+          } catch(_) {}
+          // Emissioni
+          if (tagIds.length) {
+            const unique = [];
+            const seen = new Set();
+            for (let i=0;i<tagIds.length;i++) {
+              const rawId = tagIds[i];
+              try {
+                const canon = canonicalizeId(rawId);
+                if (!seen.has(canon)) { seen.add(canon); unique.push(canon); }
+              } catch(_) {
+                if (!seen.has(rawId)) { seen.add(rawId); unique.push(rawId); }
+              }
+            }
+            emit('tagsOnline', { tagIds: unique, raw: info });
+          }
+          if (Object.keys(nameMap).length) {
+            const canonNames = {};
+            Object.entries(nameMap).forEach(([k,v]) => {
+              try { const c = canonicalizeId(k); canonNames[c] = canonNames[c] || v; } catch(_) { canonNames[k] = canonNames[k] || v; }
+            });
+            emit('tagNames', canonNames);
+          }
+          // Emissione raw dedicata per ispezione UI se serve
+          emit('personInfoRaw', info);
         } catch(e) {}
+      };
+      // --- Binary decoders for name-bearing frames (fallback when SDK doesn't parse to JSON) ---
+      // Utility: read unsigned integer of N bytes big-endian
+      const byteCalcBE = (arr, n, off) => {
+        let v = 0; for (let i=0;i<n;i++) { v = (v << 8) + arr[off + i]; } return v >>> 0;
+      };
+      const readUtf16LEString = (arr, off, byteLen) => {
+        // Protocol appears to store chars as 2 bytes little-endian (low, high)
+        let s = '';
+        for (let i=0;i<byteLen; i+=2) {
+          const lo = arr[off + i];
+          const hi = arr[off + i + 1];
+          if (lo === 0 && hi === 0) continue;
+          const code = lo + (hi << 8);
+          s += String.fromCharCode(code);
+        }
+        return s;
+      };
+      // PERSON_INFO_BIN: accumulate partial map frames and emit when complete (sanitized rewrite)
+      let personInfoBinAccum = { map_infos: {}, tag_total: 0, tag_online_total: 0 };
+      const handlePersonInfoBin = (rawBuf) => {
+        if (!(rawBuf instanceof ArrayBuffer)) return;
+        const u8 = new Uint8Array(rawBuf);
+        if (u8.length < 12) return;
+        let off = 0;
+        const totalFrames = (u8[off] << 8) + u8[off + 1]; off += 2;
+        const curFrame = (u8[off] << 8) + u8[off + 1]; off += 2;
+        const tagTotal = (u8[off] << 8) + u8[off + 1]; off += 2;
+        const onlineTotal = (u8[off] << 8) + u8[off + 1]; off += 2;
+        // skip mapCount byte (unused in observed frames)
+        off += 1;
+        const mapId = (u8[off] << 8) + u8[off + 1]; off += 2;
+        const nameLen = u8[off]; off += 1;
+        const mapName = readUtf16LEString(u8, off, nameLen); off += nameLen;
+        const onlineCounts = (u8[off] << 8) + u8[off + 1]; off += 2;
+        const tags = [];
+        for (let i = 0; i < onlineCounts && off < u8.length; i++) {
+          let tagId;
+          if (TAG64_ENABLE) { tagId = byteCalcBE(u8, 8, off); off += 8; } else { tagId = byteCalcBE(u8, 4, off); off += 4; }
+          tags.push({ tag_id: String(tagId) });
+        }
+        // reserved 2 bytes (protocol alignment)
+        off += 2;
+        if (curFrame === 1) personInfoBinAccum = { map_infos: {}, tag_total: tagTotal, tag_online_total: onlineTotal };
+        const existing = personInfoBinAccum.map_infos[mapId] || { map_id: mapId, map_name: '', online_counts: 0, tags: [] };
+        existing.map_name = mapName || existing.map_name;
+        existing.online_counts += onlineCounts;
+        existing.tags.push(...tags);
+        personInfoBinAccum.map_infos[mapId] = existing;
+        if (curFrame === totalFrames) {
+          personInfoBinAccum.map_num = Object.keys(personInfoBinAccum.map_infos).length;
+          try { window.__BLUEIOT_LAST_PERSON_BIN = personInfoBinAccum; } catch {}
+          try { pushEvent('personInfoRaw', { map_num: personInfoBinAccum.map_num }); } catch(_) {}
+          emit('personInfoRaw', personInfoBinAccum);
+          const tagIds = Object.values(personInfoBinAccum.map_infos).flatMap(m => m.tags.map(t => t.tag_id));
+          if (tagIds.length) {
+            const unique = [];
+            const seen = new Set();
+            for (let i=0;i<tagIds.length;i++) {
+              const rawId = tagIds[i];
+              try {
+                const canon = canonicalizeId(rawId);
+                if (!seen.has(canon)) { seen.add(canon); unique.push(canon); }
+              } catch(_) {
+                if (!seen.has(rawId)) { seen.add(rawId); unique.push(rawId); }
+              }
+            }
+            try { pushEvent('tagsOnline', { count: unique.length }); } catch(_) {}
+            emit('tagsOnline', { tagIds: unique, raw: personInfoBinAccum });
+          }
+        }
+      };
+      // ROLLCALL_DATA_BIN: sanitized best-effort decoder to extract tag names (UTF-16LE) without throwing
+      const handleRollcallBin = (rawBuf) => {
+        if (!(rawBuf instanceof ArrayBuffer)) return;
+        const u8 = new Uint8Array(rawBuf);
+        // keep a tiny snapshot for debugging without polluting logs
+        try {
+          window.__BLUEIOT_RAW_FRAMES = window.__BLUEIOT_RAW_FRAMES || { TAG_POS: [], PERSON_INFO: [], ROLLCALL_DATA: [] };
+          const __rbuf = window.__BLUEIOT_RAW_FRAMES.ROLLCALL_DATA; __rbuf.push(u8.slice(0, Math.min(256, u8.length))); if (__rbuf.length > 50) __rbuf.shift();
+        } catch(_) {}
+        if (u8.length < 6) { try { emit('rollcallRawBin', { byteLength: u8.length }); } catch {} return; }
+        let off = 0;
+        const nameMap = {};
+        // The vendor format varies; we scan conservatively: [tagId(4|8)][nameLen(2)][utf16le name bytes]
+        // Repeat until buffer exhausted or guard fails. This is safe and ASCII-clean.
+        while (off + 6 <= u8.length) {
+          const start = off;
+          // Read tag ID (prefer 64 if enabled)
+          let tagId = null;
+          try {
+            if (TAG64_ENABLE && off + 8 <= u8.length) { tagId = byteCalcBE(u8, 8, off); off += 8; }
+            else if (off + 4 <= u8.length) { tagId = byteCalcBE(u8, 4, off); off += 4; }
+            else break;
+          } catch(_) { break; }
+          if (off + 2 > u8.length) break;
+          const nameLen = (u8[off] << 8) + u8[off + 1]; off += 2;
+          if (nameLen > 0 && off + nameLen <= u8.length) {
+            let tagName = '';
+            try { tagName = readUtf16LEString(u8, off, nameLen); } catch(_) { tagName = ''; }
+            off += nameLen;
+            if (tagName && tagName.trim()) {
+              try { const nm = {}; addNameForIdVariants(nm, String(tagId), tagName); Object.assign(nameMap, nm); } catch(_) {}
+            }
+          } else {
+            // If the structure doesn't match, advance minimally to avoid an infinite loop
+            off = Math.max(off, start + (TAG64_ENABLE ? 8 : 4));
+          }
+          // Soft guard to avoid infinite loops on malformed frames
+          if (off <= start) break;
+        }
+        if (Object.keys(nameMap).length) {
+          try {
+            const canonNames = {};
+            Object.entries(nameMap).forEach(([k,v]) => {
+              try { const c = canonicalizeId(k); canonNames[c] = canonNames[c] || v; } catch(_) { canonNames[k] = canonNames[k] || v; }
+            });
+            emit('tagNames', canonNames);
+          } catch {}
+        }
+        try { emit('rollcallRawBin', { byteLength: u8.length, names: Object.keys(nameMap).length }); } catch {}
+      };
+      // AREA_INFO_BIN: decode single area entry with tag_name & area_name
+      const handleAreaInfoBin = (rawBuf) => {
+        if (!(rawBuf instanceof ArrayBuffer)) return;
+        const u8 = new Uint8Array(rawBuf);
+        if (u8.length < 16) return;
+        let off = 0;
+        const tagId = TAG64_ENABLE ? byteCalcBE(u8, 8, off) : byteCalcBE(u8, 4, off); off += TAG64_ENABLE ? 8 : 4;
+        const tagNameLen = (u8[off] << 8) + u8[off+1]; off += 2;
+        const tagName = readUtf16LEString(u8, off, tagNameLen); off += tagNameLen;
+        const areaId = byteCalcBE(u8, 8, off); off += 8;
+        const areaNameLen = (u8[off] << 8) + u8[off+1]; off += 2;
+        const areaName = readUtf16LEString(u8, off, areaNameLen); off += areaNameLen;
+        const mapId = byteCalcBE(u8, 2, off); off += 2;
+        const mapNameLen = (u8[off] << 8) + u8[off+1]; off += 2;
+        const mapName = readUtf16LEString(u8, off, mapNameLen); off += mapNameLen;
+        const status = u8[off]; off += 1;
+        const timestamp = byteCalcBE(u8, 8, off); off += 8;
+        const areaInfo = { tag_id: String(tagId), tag_name: tagName, area_id: String(areaId), area_name: areaName, map_id: mapId, map_name: mapName, status, timestamp };
+        emit('areaInfoRawBin', areaInfo);
+        if (tagName && tagName.trim()) {
+          const nm = {}; addNameForIdVariants(nm, String(tagId), tagName);
+          try {
+            const canonMap = {};
+            Object.entries(nm).forEach(([k,v]) => { try { const c = canonicalizeId(k); canonMap[c] = canonMap[c] || v; } catch(_) { canonMap[k] = canonMap[k] || v; } });
+            emit('tagNames', canonMap);
+          } catch(_) { emit('tagNames', nm); }
+        }
       };
   const cleanTagName = (raw) => {
         if (!raw) return '';
@@ -365,7 +810,7 @@ export const LocalsenseClient = {
         }
         return filtered;
       };
-      const handleRollcallData = (roll) => {
+  const handleRollcallData = (roll) => {
         if (typeof roll === 'string') {
           try { return handleRollcallData(JSON.parse(roll)); } catch { /* ignore */ }
         }
@@ -378,24 +823,44 @@ export const LocalsenseClient = {
           const nameMap = {};
           for (let ai=0; ai<areas.length; ai++) {
             const a = areas[ai];
-            const list = a && a.area_tag_list ? a.area_tag_list : [];
+            const list = a && (a.area_tag_list || a.tags) ? (a.area_tag_list || a.tags) : [];
             for (let ti=0; ti<list.length; ti++) {
               const t = list[ti];
               const variants = collectIdVariants(t);
-              let nm = cleanTagName(t.tag_name || '');
+              const cand = t.tag_name || t.name || t.alias || t.tagAlias;
+              let nm = cleanTagName(cand || '');
               if (variants.length && nm) variants.forEach(v => { nameMap[v] = nm; });
             }
           }
+          // Deep fallback: scan entire structure as last resort
+          extractNamesDeep(roll, nameMap);
           if (Object.keys(nameMap).length) {
-            console.log('[BlueIot] Tag names (rollcall cleaned):', nameMap);
-            emit('tagNames', nameMap);
+            try {
+              const canonNames = {};
+              Object.entries(nameMap).forEach(([k,v]) => {
+                try { const c = canonicalizeId(k); canonNames[c] = canonNames[c] || v; } catch(_) { canonNames[k] = canonNames[k] || v; }
+              });
+              console.log('[BlueIot] (rollcall cleaned):', canonNames);
+              emit('tagNames', canonNames);
+            } catch(e) { console.log('[BlueIot] (rollcall cleaned) emit failed', e?.message); }
           }
         } catch(e) { console.warn('[BlueIot] rollcall parse error:', e.message); }
       };
       // Config: fallback BIN opzionale; di default ATTIVO per permettere visibilità se il server invia solo binario.
       // Puoi disattivarlo impostando REACT_APP_BLUEIOT_IGNORE_BIN=true
-      const IGNORE_BIN = String(process.env.REACT_APP_BLUEIOT_IGNORE_BIN || 'false').toLowerCase() === 'true';
-      const handlePosBin = (buf) => {
+    const IGNORE_BIN = String(process.env.REACT_APP_BLUEIOT_IGNORE_BIN || 'false').toLowerCase() === 'true';
+    // Scala dinamica BIN (diagnostica drift vs JSON). Configurabile via env.
+    let __binAutoDiv = Number(process.env.REACT_APP_BLUEIOT_BIN_POS_DIV || POS_DIV || 100);
+    const BIN_AUTO_ENABLE = String(process.env.REACT_APP_BLUEIOT_BIN_AUTO_SCALE || 'true').toLowerCase() === 'true';
+    const BIN_RATIO_HIGH = Number(process.env.REACT_APP_BLUEIOT_BIN_SCALE_HIGH || 2.5);
+    const BIN_RATIO_LOW = Number(process.env.REACT_APP_BLUEIOT_BIN_SCALE_LOW || 0.4);
+    let lastJsonScaleRefLocal = 0; // aggiornata ad ogni frame JSON
+  let latestBaseDiv = null; // aggiornato da parseRecord
+      // Log effective position config once for easier diagnostics
+      try {
+        console.warn('[BlueIot][POSCFG]', { IGNORE_BIN, POS_DIV, BIN_AUTO_ENABLE, BIN_RATIO_LOW, BIN_RATIO_HIGH });
+      } catch(_) {}
+  const handlePosBin = (buf) => {
   if (IGNORE_BIN) { return; }
         // Se stiamo già ricevendo JSON fresco, evita di sovrascrivere con BIN (che può avere endianness/scala diversa)
         if (Date.now() - (lastJsonTs || 0) < 2000) return;
@@ -458,10 +923,11 @@ export const LocalsenseClient = {
                 let zRaw = pick(zBE, zLE);
 
                 // Normalizza in metri con divisore configurabile
-                const div = (POS_DIV && isFinite(POS_DIV) && POS_DIV > 0) ? POS_DIV : 100;
-                let x = xRaw / div;
-                let y = yRaw / div;
-                let z = zRaw / div;
+                const baseDiv = (__binAutoDiv && isFinite(__binAutoDiv) && __binAutoDiv > 0) ? __binAutoDiv : (POS_DIV && isFinite(POS_DIV) && POS_DIV > 0 ? POS_DIV : 100);
+                latestBaseDiv = baseDiv;
+                let x = xRaw / baseDiv;
+                let y = yRaw / baseDiv;
+                let z = zRaw / baseDiv;
 
                 // Battery plausibility clamp 0..100
                 if (cap > 100 && cap <= 255) cap = Math.min(cap, 100);
@@ -489,16 +955,65 @@ export const LocalsenseClient = {
                   chosen = cand8;
                 }
                 if (!chosen || chosen.ok === false) { if (chosen && chosen.next) offset = chosen.next; else break; continue; }
-                arr.push({ ...chosen, ts: Date.now() });
+                // Derive hex id from the raw bytes in buffer for stronger 64-bit identity when possible
+                try {
+                  if (chosen && chosen.next) {
+                    const span = u8.slice(offset, offset + (chosen.id && chosen.id.length > 10 ? 8 : 4));
+                    const hex = Array.from(span).map(b => b.toString(16).padStart(2,'0')).join('').toUpperCase();
+                    arr.push({ ...chosen, idHex: hex, ts: Date.now() });
+                  } else {
+                    arr.push({ ...chosen, ts: Date.now() });
+                  }
+                } catch(_) {
+                  arr.push({ ...chosen, ts: Date.now() });
+                }
                 offset = chosen.next;
               }
               if (arr.length) {
-                console.log('[BlueIot][BIN] positions parsed:', arr.length, 'sample:', arr[0]);
+                // Magnitudine media per rilevare drift vs ultimo JSON
+                let avgMag = 0;
+                try { avgMag = arr.reduce((acc,p)=>acc+Math.hypot(p.x,p.y),0)/arr.length; } catch(_) {}
+                // Recupera riferimento JSON globale se disponibile
+                try { if (window.__BLUEIOT_LAST_JSON_MAG) lastJsonScaleRefLocal = window.__BLUEIOT_LAST_JSON_MAG; } catch(_) {}
+                let appliedCorr = 1;
+                if (BIN_AUTO_ENABLE && lastJsonScaleRefLocal > 0 && avgMag > 0) {
+                  const ratio = avgMag / lastJsonScaleRefLocal;
+                  if (ratio > BIN_RATIO_HIGH || ratio < BIN_RATIO_LOW) {
+                    // Correggi dimensione riportando magnitudine vicino a quella JSON
+                    appliedCorr = ratio;
+                    arr.forEach(p => { p.x = p.x / appliedCorr; p.y = p.y / appliedCorr; });
+                    avgMag = avgMag / appliedCorr;
+                    console.warn('[BlueIot][BIN][AutoScale] ratio', ratio.toFixed(3), 'correzione applicata');
+                  }
+                }
+                // Etichetta sorgente
+                try { arr.forEach(p => { p.src = 'bin'; }); } catch(_) {}
+                try { if (typeof window !== 'undefined' && window.__BLUEIOT_VERBOSE) console.log('[BlueIot][BIN] positions parsed:', arr.length, 'sample:', arr[0]); } catch(_) {}
+                // BIN consistency checks: ensure id/hex agreement and compare magnitude with JSON reference
+                try {
+                  arr.forEach(p => {
+                    try {
+                      const pid = String(p.id ?? '');
+                      const hx = p.idHex ? String(p.idHex).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() : null;
+                      if (hx && hx.length >= 8) {
+                        const low32 = String(parseInt(hx.slice(-8), 16) >>> 0);
+                        if (pid && pid !== low32) {
+                          pushEvent('idVariantMismatch', { src: 'bin', id: pid, idHex: hx, low32, sample: p });
+                          dbg('[BlueIot][CHECK] id mismatch bin:', pid, 'vs low32(hex)', low32);
+                        }
+                      }
+                    } catch(_) {}
+                  });
+                } catch(_) {}
                 emit('position', arr);
                 posDiag.accepted += arr.length;
                 posDiag.lastSample = arr[0];
                 positionsEverReceived = true;
                 if (!firstPositionAt) firstPositionAt = Date.now();
+                try {
+                  window.__BLUEIOT_SCALE_DIAG = window.__BLUEIOT_SCALE_DIAG || {};
+                  window.__BLUEIOT_SCALE_DIAG.bin = { avgMag, lastJsonScaleRef: lastJsonScaleRefLocal, appliedCorr, baseDiv: latestBaseDiv };
+                } catch(_) {}
               }
               // Heuristica: se solo scarti e nessuna accettazione, spegni i filtri
               if (runtimeFiltersEnabled && posDiag.accepted === 0 && posDiag.droppedTooBig >= 10) {
@@ -523,6 +1038,72 @@ export const LocalsenseClient = {
   reg("TAG_POS_BIN", handlePosBin);
   reg("PERSON_INFO", handlePersonInfo);
   reg("ROLLCALL_DATA", handleRollcallData);
+  // Register BIN handlers to improve name extraction reliability
+  reg("ROLLCALL_DATA_BIN", (buf) => { try { handleRollcallBin(buf); } catch(e){} });
+  reg("PERSON_INFO_BIN", (buf) => { try { handlePersonInfoBin(buf); } catch(e){} });
+  reg("AREA_INFO_BIN", (buf) => { try { handleAreaInfoBin(buf); } catch(e){} });
+      // Extra per manuale: battery, area access, physical signs
+      reg("TAG_POWER", (data) => {
+        try {
+          if (typeof data === 'string') data = JSON.parse(data);
+          if (data && typeof Blob !== 'undefined' && data instanceof Blob) {
+            data.text().then(t => { try { const j = JSON.parse(t); emit('battery', j); } catch {} });
+            return;
+          }
+          emit('battery', data);
+        } catch(_) { /* ignore */ }
+      });
+      reg("AREA_INFO", (data) => {
+        const tryExtractNames = (obj) => {
+          try {
+            const map = {};
+            extractNamesDeep(obj, map);
+            if (Object.keys(map).length) {
+              const canonMap = {};
+              Object.entries(map).forEach(([k,v]) => { try { const c = canonicalizeId(k); canonMap[c] = canonMap[c] || v; } catch(_) { canonMap[k] = canonMap[k] || v; } });
+              emit('tagNames', canonMap);
+            }
+          } catch(_) {}
+        };
+        try {
+          if (typeof data === 'string') {
+            try { const j = JSON.parse(data); emit('areaInfo', j); tryExtractNames(j); } catch {}
+            return;
+          }
+          if (data && typeof Blob !== 'undefined' && data instanceof Blob) {
+            // Prefer textual JSON parse; if it fails, also attempt ArrayBuffer for future binary decoders
+            data.text().then(t => { try { const j = JSON.parse(t); emit('areaInfo', j); tryExtractNames(j); } catch {} });
+            return;
+          }
+          emit('areaInfo', data);
+          tryExtractNames(data);
+        } catch(_) { /* ignore */ }
+      });
+      reg("SIGN_INFO", (data) => {
+        const tryExtractNames = (obj) => {
+          try {
+            const map = {};
+            extractNamesDeep(obj, map);
+            if (Object.keys(map).length) {
+              const canonMap = {};
+              Object.entries(map).forEach(([k,v]) => { try { const c = canonicalizeId(k); canonMap[c] = canonMap[c] || v; } catch(_) { canonMap[k] = canonMap[k] || v; } });
+              emit('tagNames', canonMap);
+            }
+          } catch(_) {}
+        };
+        try {
+          if (typeof data === 'string') {
+            try { const j = JSON.parse(data); emit('signInfo', j); tryExtractNames(j); } catch {}
+            return;
+          }
+          if (data && typeof Blob !== 'undefined' && data instanceof Blob) {
+            data.text().then(t => { try { const j = JSON.parse(t); emit('signInfo', j); tryExtractNames(j); } catch {} });
+            return;
+          }
+          emit('signInfo', data);
+          tryExtractNames(data);
+        } catch(_) { /* ignore */ }
+      });
       // Useful diagnostics
       reg("WS_SWITCH_RESULT", (res) => {
         try {
@@ -618,6 +1199,17 @@ export const LocalsenseClient = {
       const origWarn = console.warn;
       console.log = function(...args) {
         try {
+          // Suppress noisy SDK logs when binary blobs are printed as text candidates
+          const s0 = args[0];
+          if (s0 && typeof s0 === 'string') {
+            if (
+              s0.includes('ws1 text candidate (from Blob)') ||
+              s0.includes('[BlueIot][SDK] ws1 text candidate') ||
+              s0.includes('text candidate (from Blob)')
+            ) {
+              return; // drop this noisy line
+            }
+          }
           if (args[0] && typeof args[0] === 'string' && args[0].includes('[BlueIot][RWS] msg BIN:')) {
             frameCounters.bin += 1;
           } else if (args[0] && typeof args[0] === 'string' && args[0].includes('[BlueIot][RWS] msg TXT:')) {
@@ -631,6 +1223,17 @@ export const LocalsenseClient = {
       };
       console.warn = function(...args) {
         try {
+          // Apply same suppression to warnings if emitted with warn
+          const s0 = args[0];
+          if (s0 && typeof s0 === 'string') {
+            if (
+              s0.includes('ws1 text candidate (from Blob)') ||
+              s0.includes('[BlueIot][SDK] ws1 text candidate') ||
+              s0.includes('text candidate (from Blob)')
+            ) {
+              return; // drop this noisy line
+            }
+          }
           if (args[0] && typeof args[0] === 'string' && args[0].includes('[BlueIot][SDK][BIN] frame header ok type=')) {
             const m = /type=0x([0-9a-fA-F]+)/.exec(args[0]);
             if (m) {
@@ -695,7 +1298,7 @@ export const LocalsenseClient = {
       }
 
       // Imposta subito il tipo di output e apri ExtraInfo per i nomi; poi attiva lo stream posizione
-    try { api.setPosOutType?.("XY"); } catch {}
+  try { api.setPosOutType?.("XY"); currentPosOutType = "XY"; } catch {}
       try { console.log(`[BlueIot] RequireExtraInfo(${hostPort})`); api.RequireExtraInfo?.(hostPort); } catch {}
   // Primo tentativo (può fallire finché Control non è aperto)
   setTimeout(() => { try { controlSwitchAttempts += 1; api.Send2WS_RequsetSwitch?.("position", 1); } catch {} }, 800);
@@ -742,6 +1345,17 @@ export const LocalsenseClient = {
       api.setTag64Show?.(!!v);
       console.log('[BlueIot][UI] Tag ID 64-bit =', !!v);
     } catch(e) { console.warn('[BlueIot] setTagId64 error:', e?.message); }
+  },
+  setPosOutType(mode) {
+    try {
+      const api = window.BlueIot;
+      if (!api) throw new Error('API non disponibile');
+      const allowed = ["XY", "GLOBAL", "GEO", "XY_GEO", "XY_GLOBAL"];
+      const m = allowed.includes(mode) ? mode : "XY";
+      api.setPosOutType?.(m);
+      currentPosOutType = m;
+      console.log('[BlueIot][UI] setPosOutType =', m);
+    } catch(e) { console.warn('[BlueIot] setPosOutType error:', e?.message); }
   },
   subscribeMapsNow() {
     try {
@@ -797,7 +1411,7 @@ export const LocalsenseClient = {
       frameCounters: { ...frameCounters },
       lastCloseCode,
       consecutive1006,
-      runtime: { proto: runtimeBasicProto, forceUnsalted: runtimeForceUnsalted, disableAutoMode: DISABLE_AUTOMODE, filtersEnabled: runtimeFiltersEnabled, safeAbs: SAFE_ABS_POS },
+      runtime: { proto: runtimeBasicProto, forceUnsalted: runtimeForceUnsalted, disableAutoMode: DISABLE_AUTOMODE, filtersEnabled: runtimeFiltersEnabled, safeAbs: SAFE_ABS_POS, posOutType: currentPosOutType },
       firstPositionAt,
       firstErrorAt,
       positionsEverReceived,
@@ -816,3 +1430,12 @@ LocalsenseClient._controlRequested = false;
 LocalsenseClient._controlOpened = false;
 LocalsenseClient._mapSubscribed = false;
 LocalsenseClient._lastMapIds = [];
+// Expose for console debugging (dev only)
+try {
+  if (typeof window !== 'undefined') {
+    window.LocalsenseClient = LocalsenseClient;
+    window.getBlueIotDiag = () => {
+      try { return LocalsenseClient.getDiagnostics(); } catch(e) { return { error: e?.message || String(e) }; }
+    };
+  }
+} catch(_) {}

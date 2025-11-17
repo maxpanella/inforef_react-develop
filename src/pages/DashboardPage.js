@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { canonicalizeId } from "../services/tagCanonicalizer";
 import LZString from "lz-string";
 import { useData } from "../context/DataContext";
 import { DxfViewer } from "../components/DxfViewer";
@@ -32,13 +33,44 @@ const DashboardPage = () => {
     saveCalibration,
     loadCalibration,
     resetCalibration,
+    reloadTags,
+    createTag,
+    removeTag,
+    restoreTag,
   } = useData();
+
+  // Set dei tag presenti in anagrafica (DB), canonicalizzati
+  const backendTagSet = React.useMemo(() => {
+    try {
+      const s = new Set();
+      (tags || []).forEach(t => {
+        try {
+          const c = canonicalizeId(t.id);
+          if (!c) return;
+          s.add(c);
+          // add common variant to ease matching (low32 or hex form)
+          const hx = String(c).replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+          if (hx && /^[0-9A-Fa-f]{8,}$/.test(hx)) {
+            // canonical is HEX -> also store low32 decimal
+            try { s.add(String(parseInt(hx.slice(-8), 16) >>> 0)); } catch(_) {}
+          } else if (/^[0-9]+$/.test(String(c))) {
+            // canonical is decimal -> also store 8-char hex
+            try { s.add((Number(c)>>>0).toString(16).toUpperCase().padStart(8,'0')); } catch(_) {}
+          }
+        } catch(_) {}
+      });
+      return s;
+    } catch { return new Set(); }
+  }, [tags]);
 
   const [mapData, setMapData] = useState(null);
   const [enhancedPositions, setEnhancedPositions] = useState({});
   const [selectedTag, setSelectedTag] = useState(null);
   const [mapBounds, setMapBounds] = useState(null); // {min:{x,y}, max:{x,y}} unità DXF raw
   const [toast, setToast] = useState(null); // piccoli messaggi di conferma
+  // Suggestion UI state for auto-centering offsets
+  const [suggestionVisible, setSuggestionVisible] = useState(false);
+  const [suggestedOffsets, setSuggestedOffsets] = useState(null);
   // Tool di calibrazione scala tramite spostamento
   const [calibTagId, setCalibTagId] = useState(""); // cattura A/B dallo stesso tag
   const [ptA, setPtA] = useState(null); // {x,y,ts}
@@ -169,6 +201,17 @@ const DashboardPage = () => {
     const dy = cy - avgY;
     updateCalibration({ offsetX: (Number(calibration.offsetX)||0) + dx, offsetY: (Number(calibration.offsetY)||0) + dy });
     try { setToast({ type: 'success', msg: 'Offset aggiornati per centrare i tag sulla mappa' }); } catch(_) {}
+  };
+
+  const handleUseRawChange = (checked) => {
+    // If enabling RAW and all tags are out of bounds, offer to auto-align
+    setUseRawPositions(checked);
+    try {
+      if (checked && offMapInfo.total > 0 && offMapInfo.inMap === 0) {
+        const want = window.confirm('I tag risultano fuori dalla planimetria. Vuoi riallinearli automaticamente aggiornando gli offset?');
+        if (want) autoAlignOffsets();
+      }
+    } catch(_) {}
   };
 
   // Seleziona il primo sito se non ce n'è uno corrente
@@ -394,23 +437,31 @@ EOF`;
       return { x: xx, y: yy };
     };
     // Filtra per recenti
+    // Canonicalizza ID per evitare duplicati usando il canonicalizer centralizzato (preferisce HEX completo)
+    const canonicalMap = {}; // canonKey -> entry
     Object.entries(positions).forEach(([tagId, pos]) => {
       if (!pos || !pos.ts) return;
       const age = now - pos.ts;
-      if (age <= ACTIVE_WINDOW_MS) {
-        const t = applyTransform(pos.x, pos.y);
-        positionsWithInfo.push({
-          tagId,
-          ...pos,
-          x: t.x,
-          y: t.y,
-          name: `Tag ${tagId}`,
-          type: "unknown",
-          entityId: null,
-          ageMs: age,
-        });
+      if (age > ACTIVE_WINDOW_MS) return;
+      const canon = canonicalizeId(tagId);
+      const t = applyTransform(pos.x, pos.y);
+      const entry = {
+        tagId,
+        canonId: canon,
+        ...pos,
+        x: t.x,
+        y: t.y,
+        name: `Tag ${tagId}`,
+        type: 'unknown',
+        entityId: null,
+        ageMs: age,
+      };
+      // Se già presente stesso canon, tieni quello più recente
+      if (!canonicalMap[canon] || (canonicalMap[canon].ts < entry.ts)) {
+        canonicalMap[canon] = entry;
       }
     });
+    positionsWithInfo = Object.values(canonicalMap);
 
     // Ordina per timestamp decrescente
     positionsWithInfo.sort((a, b) => b.ts - a.ts);
@@ -423,6 +474,21 @@ EOF`;
       const variants = new Set();
       const s = String(id || '');
       variants.add(s);
+      // Include idHex from the live position if available
+      try {
+        const idHex = (positions && positions[s] && positions[s].idHex) ? String(positions[s].idHex) : null;
+        if (idHex) {
+          const up = idHex.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+          if (up) {
+            variants.add(up);
+            if (up.length >= 8) {
+              const low = up.slice(-8);
+              variants.add(low);
+              try { variants.add(String(parseInt(low, 16))); } catch(_) {}
+            }
+          }
+        }
+      } catch(_) {}
       // numeric variants
       const num = Number(s);
       if (!Number.isNaN(num)) {
@@ -445,15 +511,25 @@ EOF`;
       return null;
     };
 
-    // Trasforma in mappa per viewer
+    // Trasforma in mappa per viewer: usa chiave canonica per evitare cambi ID (hex/dec) nel tempo
     const mapObj = {};
     const rawObj = {};
+    const displayId = (p) => {
+      // preferisci forma 0xHEX a 8+ cifre se disponibile
+      const s = String(p.tagId);
+      const hl = s.replace(/[^0-9A-Fa-f]/g,'');
+      const hasHexLetter = /[A-Fa-f]/.test(hl);
+      if (hasHexLetter && hl.length >= 8) return `0x${hl.toUpperCase()}`;
+      const n = Number(s);
+      return !Number.isNaN(n) ? `0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : s;
+    };
     truncated.forEach(p => {
       const tName = resolveName(p.tagId);
-      mapObj[p.tagId] = { ...p, name: tName || p.name };
-      // Mantieni anche RAW per debug (prima della calibrazione)
+      const key = p.canonId || p.tagId; // p.canonId è già canonicalizzato sopra
+      mapObj[key] = { ...p, id: p.tagId, idHexShown: displayId(p), name: tName || p.name };
+      // Mantieni anche RAW per debug (prima della calibrazione) allineato alla chiave canonica
       const orig = positions[p.tagId];
-      if (orig) rawObj[p.tagId] = { x: Number(orig.x) || 0, y: Number(orig.y) || 0, name: tName || p.name };
+      if (orig) rawObj[key] = { x: Number(orig.x) || 0, y: Number(orig.y) || 0, name: tName || p.name };
     });
 
     if (Object.keys(mapObj).length === 0 && !isConnected && SHOW_FAKE_TAGS) {
@@ -473,6 +549,59 @@ EOF`;
     return () => clearTimeout(id);
   }, [toast]);
 
+  // Determine if many tags are outside the current map bounds -> show suggestion
+  const offMapStats = (() => {
+    try {
+      const keys = Object.keys(enhancedPositions || {});
+      if (!mapBounds || keys.length === 0) return { total: 0, off: 0, frac: 0 };
+      const b = mapBounds;
+      let off = 0;
+      keys.forEach(k => {
+        const p = enhancedPositions[k];
+        if (!p) return;
+        if (p.x < b.min.x || p.x > b.max.x || p.y < b.min.y || p.y > b.max.y) off += 1;
+      });
+      return { total: keys.length, off, frac: keys.length ? (off / keys.length) : 0 };
+    } catch (_) { return { total: 0, off: 0, frac: 0 }; }
+  })();
+
+  // When fraction high, auto-show suggestion banner (but don't auto-apply)
+  useEffect(() => {
+    try {
+      if (offMapStats.total > 0 && offMapStats.frac >= 0.5) setSuggestionVisible(true);
+      else setSuggestionVisible(false);
+    } catch(_) { setSuggestionVisible(false); }
+  }, [offMapStats.total, offMapStats.frac]);
+
+  const computeSuggestedOffsets = () => {
+    if (!mapBounds) return null;
+    const keys = Object.keys(enhancedPositions || {});
+    if (!keys || keys.length === 0) return null;
+    // pick the most recent tag (first key) as anchor
+    const first = enhancedPositions[keys[0]];
+    if (!first) return null;
+    const centerX = ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2;
+    const centerY = ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2;
+    const current = calibration || {};
+    const offsetX_new = (Number(current.offsetX) || 0) + (centerX - first.x);
+    const offsetY_new = (Number(current.offsetY) || 0) + (centerY - first.y);
+    return { offsetX: offsetX_new, offsetY: offsetY_new };
+  };
+
+  const onSuggestApply = () => {
+    const s = computeSuggestedOffsets();
+    if (!s) return;
+    updateCalibration(s);
+    setSuggestedOffsets(null);
+    setSuggestionVisible(false);
+    try { setToast({ type: 'success', msg: 'Offset applicati (suggerimento)' }); } catch(_) {}
+  };
+
+  const onSuggestPreview = () => {
+    const s = computeSuggestedOffsets();
+    setSuggestedOffsets(s);
+  };
+
   // Gestisce la selezione di un tag (click da mappa o lista)
   const handleTagSelect = (tagId) => {
     console.log("Tag selezionato:", tagId);
@@ -484,6 +613,54 @@ EOF`;
 
   const countUnassociated = () =>
     tags.filter((t) => !tagAssociations.find((a) => a.tagId === t.id)).length;
+
+  const handleAddTag = async () => {
+    let raw = window.prompt('Inserisci ID Tag (dec o hex, es: 12345 o 0x12AB34CD)');
+    if (!raw) return;
+    raw = raw.trim();
+    if (!raw) return;
+    const canon = canonicalizeId(raw);
+    if (!canon) { alert('ID non valido'); return; }
+    try {
+      await createTag(canon, null);
+      await reloadTags();
+      setToast({ type: 'success', msg: `Tag ${canon} aggiunto` });
+    } catch(e) {
+      alert('Errore nel salvataggio del tag: ' + (e?.message || ''));
+    }
+  };
+
+  const handleAddSpecificTag = async (rawId) => {
+    const canon = canonicalizeId(rawId);
+    if (!canon) return;
+    try {
+      await createTag(canon, null);
+      await reloadTags();
+      setToast({ type: 'success', msg: `Tag ${canon} aggiunto` });
+    } catch(e) {
+      alert('Errore nel salvataggio del tag: ' + (e?.message || ''));
+    }
+  };
+
+  const handleRemoveSpecificTag = async (rawId) => {
+    const canon = canonicalizeId(rawId);
+    if (!canon) return;
+    const confirm = window.confirm(`Rimuovere il TAG ${canon}?
+• Se non ha assegnazioni o storico: eliminazione definitiva.
+• Altrimenti: sarà marcato come dismesso (soft delete).`);
+    if (!confirm) return;
+    try {
+      await removeTag(canon);
+      await reloadTags();
+      setToast({ type: 'success', msg: `Richiesta di rimozione eseguita per ${canon}` });
+      // se stavi selezionando proprio quel tag e non è più in live, pulisci selezione
+      if (selectedTag && canonicalizeId(selectedTag) === canon && !enhancedPositions[canon]) {
+        setSelectedTag(null);
+      }
+    } catch(e) {
+      alert('Errore nella rimozione del tag: ' + (e?.message || ''));
+    }
+  };
 
   return (
     <div className="p-6">
@@ -501,6 +678,35 @@ EOF`;
         <span className={isConnected ? "text-green-600" : "text-red-600"}>
           {isConnected ? "Connesso a 192.168.1.11" : "Non connesso a 192.168.1.11"}
         </span>
+        {/* Suggestion banner: appare se molti tag risultano fuori dalla planimetria */}
+        {suggestionVisible && offMapStats.total > 0 && (
+          <div className="mb-3 p-3 rounded border bg-yellow-50 text-sm flex items-center justify-between">
+            <div>
+              <strong>Rilevate posizioni fuori dalla planimetria.</strong>
+              <div className="text-xs text-gray-600">{offMapStats.off} di {offMapStats.total} tag ({Math.round(offMapStats.frac*100)}%) risultano al di fuori dei confini.</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={onSuggestPreview} className="px-2 py-1 bg-indigo-600 text-white rounded text-sm">Suggerisci offset</button>
+              <button onClick={() => setSuggestionVisible(false)} className="px-2 py-1 bg-gray-200 rounded text-sm">Chiudi</button>
+            </div>
+          </div>
+        )}
+
+        {/* Preview box per la proposta di offset */}
+        {suggestedOffsets && (
+          <div className="mb-3 p-3 rounded border bg-white text-sm">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-medium">Anteprima offset proposti</div>
+                <div className="text-xs text-gray-600 mt-1">offsetX: {Number(suggestedOffsets.offsetX).toFixed(2)} — offsetY: {Number(suggestedOffsets.offsetY).toFixed(2)}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={onSuggestApply} className="px-2 py-1 bg-emerald-600 text-white rounded text-sm">Applica</button>
+                <button onClick={() => setSuggestedOffsets(null)} className="px-2 py-1 bg-gray-200 rounded text-sm">Annulla</button>
+              </div>
+            </div>
+          </div>
+        )}
         {simpleMode && (
           <button
             onClick={() => saveCalibration()}
@@ -525,7 +731,9 @@ EOF`;
         <div>Tag attivi: {Object.keys(enhancedPositions).length}</div>
         <div className="flex flex-wrap gap-3 items-center text-xs">
           <span>Calibrazione:</span>
-          <label className="flex items-center gap-1 mr-2"><input type="checkbox" checked={useRawPositions} onChange={e => setUseRawPositions(e.target.checked)} /> ignora calibrazione (mostra RAW)</label>
+          <label className="flex items-center gap-1 mr-2">
+            <input type="checkbox" checked={useRawPositions} onChange={e => handleUseRawChange(e.target.checked)} /> ignora calibrazione (mostra RAW)
+          </label>
           <label className="flex items-center gap-1 mr-2"><input type="checkbox" checked={isolateSelected} onChange={e => setIsolateSelected(e.target.checked)} /> mostra solo tag selezionato</label>
           <label className="flex items-center gap-1 mr-2"><input type="checkbox" checked={followSelected} onChange={e => setFollowSelected(e.target.checked)} /> segui spostamento tag</label>
           <label>Scale <input type="number" step="0.01" defaultValue={calibration.scale} className="border px-1 w-16"
@@ -544,6 +752,7 @@ EOF`;
             <button className="px-2 py-1 bg-emerald-600 text-white rounded" onClick={() => saveCalibration()}>Salva</button>
             <button className="px-2 py-1 bg-sky-600 text-white rounded" onClick={() => loadCalibration()}>Ricarica</button>
             <button className="px-2 py-1 bg-rose-600 text-white rounded" onClick={() => resetCalibration()}>Reset</button>
+            <button className="px-2 py-1 bg-yellow-600 text-white rounded" onClick={() => { try { window.LocalsenseClient?.forcePositionSwitch?.(); console.log('forcePositionSwitch called'); console.log(window.getBlueIotDiag()); } catch(e){ console.error(e); } }}>Retry positions</button>
           </div>
         </div>
         <div className="text-[11px] text-gray-600">normScale (auto): {Number(calibration.normalizationScale || 1).toFixed(4)}</div>
@@ -717,7 +926,10 @@ EOF`;
           <p className="text-2xl">{countByType("asset")}</p>
         </div>
         <div className="bg-white p-4 rounded shadow">
-          <h2 className="text-lg font-medium">Tag Disponibili</h2>
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="text-lg font-medium">Tag Disponibili</h2>
+            <button onClick={handleAddTag} className="px-2 py-1 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500">Aggiungi TAG</button>
+          </div>
           <p className="text-2xl">{countUnassociated()}</p>
         </div>
       </div>
@@ -755,7 +967,24 @@ EOF`;
                   tagPositions={isolateSelected && selectedTag && enhancedPositions[selectedTag] ? { [selectedTag]: enhancedPositions[selectedTag] } : enhancedPositions}
                   debugRawPositions={useRawPositions ? {} : (typeof window !== 'undefined' ? (isolateSelected && selectedTag && window.__DEBUG_RAW && window.__DEBUG_RAW[selectedTag] ? { [selectedTag]: window.__DEBUG_RAW[selectedTag] } : window.__DEBUG_RAW || {}) : {})}
                   showTagsMessage={true}
-                  focusPoint={followSelected && selectedTag && enhancedPositions[selectedTag] ? { x: enhancedPositions[selectedTag].x, y: enhancedPositions[selectedTag].y, ts: Date.now() } : null}
+                  focusPoint={(function(){
+                    if (!followSelected || !selectedTag) return null;
+                    const direct = enhancedPositions[selectedTag];
+                    if (direct) return { x: direct.x, y: direct.y, ts: Date.now() };
+                    // risolvi tramite varianti id se la chiave è cambiata (dec/hex)
+                    const s = String(selectedTag);
+                    const alts = [];
+                    const stripped = s.replace(/[^0-9A-Fa-f]/g,'').toUpperCase();
+                    if (/^[0-9]+$/.test(s)) {
+                      try { const n = parseInt(s,10)>>>0; alts.push(String(n)); alts.push(n.toString(16).toUpperCase()); } catch(_) {}
+                    }
+                    if (stripped) {
+                      alts.push(stripped);
+                      if (stripped.length>=8) { const low=stripped.slice(-8); alts.push(low); try { alts.push(String(parseInt(low,16))); } catch(_) {} }
+                    }
+                    for (let i=0;i<alts.length;i++) { const e = enhancedPositions[alts[i]]; if (e) return { x: e.x, y: e.y, ts: Date.now() }; }
+                    return null;
+                  })()}
                   onTagClick={(tagId) => handleTagSelect(tagId)}
                   onNormalizationChange={(ns) => {
                     // salva il fattore per coerenza futura tra client
@@ -806,10 +1035,10 @@ EOF`;
                 title="Chiudi"
               >✕</button>
               <h3 className="font-medium text-blue-800 pr-4">
-                {enhancedPositions[selectedTag]?.name || (() => { const s=String(selectedTag); const hl=s.replace(/[^0-9A-Fa-f]/g,''); if (/^[0-9A-Fa-f]{8,}$/.test(hl)) return `Tag 0x${hl.toUpperCase()}`; const n=Number(s); return !Number.isNaN(n)? `Tag 0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : `Tag ${s}`; })()}
+                {enhancedPositions[selectedTag]?.name || (() => { const s=String(selectedTag); const hl=s.replace(/[^0-9A-Fa-f]/g,''); const hasHexLetter=/[A-Fa-f]/.test(hl); if (hasHexLetter && hl.length>=8) return `Tag 0x${hl.toUpperCase()}`; const n=Number(s); return !Number.isNaN(n)? `Tag 0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : `Tag ${s}`; })()}
               </h3>
               <div className="mt-1 grid grid-cols-1 text-xs text-blue-900 gap-y-1">
-                <div><span className="font-semibold">ID:</span> {(() => { const s=String(selectedTag); const hl=s.replace(/[^0-9A-Fa-f]/g,''); if (/^[0-9A-Fa-f]{8,}$/.test(hl)) return '0x'+hl.toUpperCase(); const n=Number(s); return !Number.isNaN(n)? ('0x'+(n>>>0).toString(16).toUpperCase().padStart(8,'0')) : s; })()}</div>
+                <div><span className="font-semibold">ID:</span> {(() => { const s=String(selectedTag); const hl=s.replace(/[^0-9A-Fa-f]/g,''); const hasHexLetter=/[A-Fa-f]/.test(hl); if (hasHexLetter && hl.length>=8) return '0x'+hl.toUpperCase(); const n=Number(s); return !Number.isNaN(n)? ('0x'+(n>>>0).toString(16).toUpperCase().padStart(8,'0')) : s; })()}</div>
                 {enhancedPositions[selectedTag] && (
                   <>
                     <div><span className="font-semibold">Pos:</span> {enhancedPositions[selectedTag].x.toFixed(2)}, {enhancedPositions[selectedTag].y.toFixed(2)}</div>
@@ -829,6 +1058,15 @@ EOF`;
               <div className="mt-3 flex gap-2 flex-wrap text-xs">
                 <button onClick={centerSelectedTag} className="px-2 py-1 bg-indigo-600 text-white rounded" title="Centra il tag e aggiorna Offset">Centra tag</button>
                 <button onClick={placeSelectedTag} className="px-2 py-1 bg-purple-600 text-white rounded" title="Imposta destinazione e aggiorna Offset">Posiziona manuale</button>
+                {!backendTagSet.has(canonicalizeId(selectedTag)) && (
+                  <button onClick={() => handleAddSpecificTag(selectedTag)} className="px-2 py-1 bg-emerald-700 text-white rounded" title="Aggiungi questo TAG all'anagrafica">Aggiungi TAG</button>
+                )}
+                {backendTagSet.has(canonicalizeId(selectedTag)) && (
+                  <button onClick={() => handleRemoveSpecificTag(selectedTag)} className="px-2 py-1 bg-rose-600 text-white rounded" title="Rimuovi questo TAG dall'anagrafica">Rimuovi TAG</button>
+                )}
+                  {followSelected && (
+                    <button onClick={() => { try { if (typeof window !== 'undefined') { window.__DXF_EXIT_FOLLOW = true; } } catch(_){}; setFollowSelected(false); }} className="px-2 py-1 bg-yellow-600 text-black rounded" title="Esci da follow">Esci da follow</button>
+                  )}
                 {!simpleMode && (
                   <div className="flex items-center gap-3 ml-auto">
                     <label className="flex items-center gap-1"><input type="checkbox" checked={isolateSelected} onChange={e=> setIsolateSelected(e.target.checked)} /> mostra solo questo tag</label>
@@ -843,21 +1081,49 @@ EOF`;
             {Object.keys(enhancedPositions).length > 0 ? (
               <ul className="divide-y divide-gray-200">
                 {Object.entries(enhancedPositions).map(([tagId, info]) => (
-                  <li key={tagId} className={`py-3 px-2 cursor-pointer hover:bg-gray-50 ${selectedTag === tagId ? "bg-blue-50" : ""}`}
-                      onClick={() => handleTagSelect(tagId)}>
-                    <div className="flex items-start gap-3">
+                  <li key={tagId} className={`py-3 px-2 hover:bg-gray-50 ${selectedTag === tagId ? "bg-blue-50" : ""}`}>
+                    <div className="flex items-start gap-3" onClick={() => handleTagSelect(tagId)}>
                       <div className={`w-3 h-3 rounded-full mt-1 ${info.type === "employee" ? "bg-blue-500" : "bg-green-500"}`}></div>
                       <div className="flex-1">
                         <div className="font-medium">
-                          {info.name || (() => { const s=String(tagId); const hl=s.replace(/[^0-9A-Fa-f]/g,''); if (/^[0-9A-Fa-f]{8,}$/.test(hl)) return `Tag 0x${hl.toUpperCase()}`; const n=Number(s); return !Number.isNaN(n)? `Tag 0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : `Tag ${s}`; })()}
+                          {info.name || `Tag ${info.idHexShown || tagId}`}
                         </div>
                         <div className="text-xs text-gray-500">
-                          {(() => { const s=String(tagId); const hl=s.replace(/[^0-9A-Fa-f]/g,''); if (/^[0-9A-Fa-f]{8,}$/.test(hl)) return `0x${hl.toUpperCase()}`; const n=Number(s); return !Number.isNaN(n)? `0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : s; })()} • ({info.x.toFixed(1)}, {info.y.toFixed(1)}) • age {Math.round(info.ageMs)}ms
+                          {(info.idHexShown || tagId)} • ({info.x.toFixed(1)}, {info.y.toFixed(1)}) • age {Math.round(info.ageMs)}ms
                         </div>
                       </div>
+                      {!backendTagSet.has(canonicalizeId(tagId)) && (
+                        <button
+                          className="ml-2 px-2 py-0.5 text-[11px] rounded bg-emerald-600 text-white hover:bg-emerald-500"
+                          onClick={(e) => { e.stopPropagation(); handleAddSpecificTag(tagId); }}
+                          title="Aggiungi questo TAG all'anagrafica"
+                        >Aggiungi</button>
+                      )}
                     </div>
                   </li>
                 ))}
+              </ul>
+            ) : (!isConnected && (tags||[]).length > 0 ? (
+              <ul className="divide-y divide-gray-200">
+                {(tags||[]).filter(t => !t.decommissionedAt).map(t => {
+                  const canon = canonicalizeId(t.id);
+                  return (
+                    <li key={t.id} className="py-3 px-2 flex items-start gap-3 bg-gray-50">
+                      <div className="w-3 h-3 rounded-full mt-1 bg-gray-400" />
+                      <div className="flex-1">
+                        <div className="font-medium">Tag {canon}</div>
+                        <div className="text-xs text-gray-500">Offline • registrato in anagrafica</div>
+                      </div>
+                      {!backendTagSet.has(canon) && (
+                        <button
+                          className="ml-2 px-2 py-0.5 text-[11px] rounded bg-emerald-600 text-white hover:bg-emerald-500"
+                          onClick={(e) => { e.stopPropagation(); handleAddSpecificTag(t.id); }}
+                          title="Aggiungi questo TAG all'anagrafica"
+                        >Aggiungi</button>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             ) : (
               <div className="py-8 text-center text-gray-500">
@@ -868,7 +1134,99 @@ EOF`;
                 <p className="mt-2">Nessun tag attivo rilevato</p>
                 <p className="mt-1 text-sm">I tag appariranno qui quando saranno online</p>
               </div>
-            )}
+            ))}
+          </div>
+        </div>
+
+        {/* Anagrafica TAG (tutti, inclusi offline) */}
+        <div className="lg:col-span-1 bg-white p-4 rounded shadow mt-6 lg:mt-0">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-medium">Anagrafica TAG</h2>
+            <div className="flex items-center gap-2">
+              <button onClick={() => reloadTags()} className="px-2 py-1 text-xs rounded bg-gray-200 hover:bg-gray-300">Aggiorna</button>
+            </div>
+          </div>
+          {(() => {
+            const activeSet = new Set(Object.keys(enhancedPositions || {}).map(k => canonicalizeId(k)));
+            const total = (tags || []).length;
+            const online = (tags || []).filter(t => activeSet.has(canonicalizeId(t.id))).length;
+            const offline = total - online;
+            return (
+              <div className="text-xs text-gray-600 mb-2">Totali: {total} • Online: {online} • Offline: {offline}</div>
+            );
+          })()}
+          {/* no React state here to avoid rerenders; using dataset flag above */}
+          {/* semplice filtro offline/all */}
+          <div className="mb-2 text-xs">
+            <label className="inline-flex items-center gap-1">
+              <input type="checkbox" onChange={(e)=>{
+                const box = e.target; const cont = box.closest('.anagrafica-wrapper'); if (!cont) return;
+                cont.dataset.onlyOffline = box.checked ? '1' : '0';
+              }} /> Mostra solo offline
+            </label>
+          </div>
+          <div className="anagrafica-wrapper" data-only-offline="0">
+            <ul className="divide-y divide-gray-200 max-h-80 overflow-auto">
+              {(tags || []).map((t) => {
+                const canon = canonicalizeId(t.id);
+                const isOnline = (() => {
+                  if (Object.prototype.hasOwnProperty.call(enhancedPositions, canon)) return true;
+                  const hx = String(canon).replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+                  if (hx && /^[0-9A-Fa-f]{8,}$/.test(hx)) {
+                    try { const low = String(parseInt(hx.slice(-8), 16) >>> 0); if (Object.prototype.hasOwnProperty.call(enhancedPositions, low)) return true; } catch(_) {}
+                  } else if (/^[0-9]+$/.test(String(canon))) {
+                    try { const h8 = (Number(canon)>>>0).toString(16).toUpperCase().padStart(8,'0'); if (Object.prototype.hasOwnProperty.call(enhancedPositions, h8)) return true; } catch(_) {}
+                  }
+                  return false;
+                })();
+                const isDecommissioned = !!t.decommissionedAt;
+                return (
+                  <li key={t.id} className={`py-2 px-1 text-sm flex items-center justify-between ${isDecommissioned ? 'opacity-60' : ''}`}
+                      style={{ display: (function(){ try { const wrap = document.querySelector('.anagrafica-wrapper'); const only = wrap && wrap.dataset.onlyOffline==='1'; return (only && isOnline) ? 'none' : ''; } catch(_) { return ''; } })() }}>
+                    <div className="flex items-center gap-2">
+                            <span className={`inline-block w-2 h-2 rounded-full ${isDecommissioned ? 'bg-rose-400' : (isOnline? 'bg-emerald-500':'bg-gray-400')}`}></span>
+                            <span className="font-mono text-[12px]">{canon}</span>
+                            {(() => {
+                              try {
+                                // Compute hex full and low32 variants for display
+                                let hexFull = null, low32 = null;
+                                const c = String(canon || '');
+                                const rawHex = c.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+                                if (/[A-F]/i.test(rawHex) && rawHex.length >= 8) {
+                                  hexFull = '0x' + rawHex;
+                                  try { low32 = String(parseInt(rawHex.slice(-8), 16) >>> 0); } catch(_) { low32 = null; }
+                                } else if (/^[0-9]+$/.test(c)) {
+                                  low32 = String(Number(c) >>> 0);
+                                  try { hexFull = '0x' + (Number(c)>>>0).toString(16).toUpperCase().padStart(8,'0'); } catch(_) { hexFull = null; }
+                                }
+                                if (hexFull || low32) {
+                                  return (<span className="ml-2 text-[11px] text-gray-500">{hexFull ? hexFull : ''}{hexFull && low32 ? ' • ' : ''}{low32 ? low32 : ''}</span>);
+                                }
+                              } catch(_) {}
+                              return null;
+                            })()}
+                      {Number.isFinite(Number(t.battery)) && <span className="text-[11px] text-gray-500">{t.battery}%</span>}
+                      {isDecommissioned && <span className="text-[11px] text-rose-700 border border-rose-200 bg-rose-50 px-1 rounded">Dismesso</span>}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-[11px] ${isDecommissioned ? 'text-rose-700' : (isOnline? 'text-emerald-700':'text-gray-500')}`}>{isDecommissioned ? 'Dismesso' : (isOnline? 'Online':'Offline')}</span>
+                      {isDecommissioned ? (
+                        <button className="px-2 py-0.5 text-[11px] rounded bg-emerald-600 text-white hover:bg-emerald-500"
+                                onClick={async () => { try { await restoreTag(canon); await reloadTags(); setToast({ type: 'success', msg: `Tag ${canon} ripristinato` }); } catch(e){ alert('Errore nel ripristino: '+(e?.message||'')); } }}
+                                title="Ripristina TAG">Ripristina</button>
+                      ) : (
+                        <button className="px-2 py-0.5 text-[11px] rounded bg-rose-600 text-white hover:bg-rose-500"
+                                onClick={() => handleRemoveSpecificTag(t.id)}
+                                title="Rimuovi TAG">Rimuovi</button>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+              {(tags || []).length === 0 && (
+                <li className="py-6 text-center text-gray-500 text-sm">Nessun tag in anagrafica</li>
+              )}
+            </ul>
           </div>
         </div>
       </div>

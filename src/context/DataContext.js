@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, restoreTag as apiRestoreTag } from "../services/backendClient";
 import { LocalsenseClient } from "../services/localsenseClient";
 
 const DataContext = createContext(null);
@@ -13,7 +14,34 @@ export const DataProvider = ({ children }) => {
   // Anagrafiche (se servono le caricherai altrove)
   const [employees] = useState([]);
   const [assets] = useState([]);
-  const [tags] = useState([]);
+  const [tags, setTags] = useState([]);
+    // Load tags registry from backend
+    const loadTags = async () => {
+      try {
+        const list = await apiGetTags();
+        setTags(Array.isArray(list) ? list : []);
+      } catch (_) {
+        setTags([]);
+      }
+    };
+    useEffect(() => { loadTags(); }, []);
+
+    const createTag = async (id, battery = null) => {
+      await apiCreateTag(String(id), battery);
+      await loadTags();
+      return true;
+    };
+
+    const removeTag = async (id) => {
+      await apiDeleteTag(String(id));
+      await loadTags();
+      return true;
+    };
+    const restoreTag = async (id) => {
+      await apiRestoreTag(String(id));
+      await loadTags();
+      return true;
+    };
   const [tagAssociations] = useState([]);
 
   // Realtime
@@ -109,8 +137,9 @@ export const DataProvider = ({ children }) => {
 
   // Debug
   const [lastTag, setLastTag] = useState(null);
-  const [lastRawFrame, setLastRawFrame] = useState(null);
-  const firstLogsLeft = useRef(5);
+  const [lastRawFrame] = useState(null);
+  // reserved for future logging throttling
+  // const firstLogsLeft = useRef(5);
 
   useEffect(() => {
     const onOpen = () => setIsConnected(true);
@@ -168,6 +197,8 @@ export const DataProvider = ({ children }) => {
         }
       });
       setPositions(nextLive);
+  // Expose last emitted positions for quick debugging and console inspection
+  try { if (typeof window !== 'undefined') { window.__BLUEIOT_LAST_EMITTED_POS = nextLive; console.debug('[DataContext] setPositions count=', Object.keys(nextLive).length); } } catch(_) {}
       // aggiorna info debug ultimo tag
       try {
         if (Array.isArray(list) && list.length > 0) {
@@ -227,8 +258,13 @@ export const DataProvider = ({ children }) => {
       vibrateTag,
       lastVibrateAck,
       videoTrack,
+      // tag registry ops
+      reloadTags: loadTags,
+      createTag,
+      removeTag,
+      restoreTag,
     }),
-    [sites, currentSite, positions, isConnected, tagNames, calibration, lastTag, lastRawFrame, lastVibrateAck]
+    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, saveCalibration, loadCalibration, resetCalibration, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
   );
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;

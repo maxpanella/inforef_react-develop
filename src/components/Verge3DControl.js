@@ -5,7 +5,51 @@ import { useData } from '../context/DataContext';
 
 const Verge3DControl = () => {
 	const { isConnected, sendCommand, sendSceneEvent } = useVerge3DConnection();
-	const { tags, positions, tagAssociations, employees, assets } = useData();
+	const { tags, positions, tagAssociations, employees, assets, tagNames } = useData();
+	// Helper: resolve human-friendly name from tagNames using id and idHex variants
+	const resolveName = (id) => {
+		try {
+			const names = tagNames || {};
+			const variants = new Set();
+			const s = String(id || '');
+			variants.add(s);
+			// include idHex from position if present
+			const hx = positions && positions[s] && positions[s].idHex ? String(positions[s].idHex) : null;
+			if (hx) {
+				const up = hx.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+				if (up) {
+					variants.add(up);
+					if (up.length >= 8) {
+						const low = up.slice(-8);
+						variants.add(low);
+						try { variants.add(String(parseInt(low, 16))); } catch(_) {}
+					}
+				}
+			}
+			// numeric variants
+			const num = Number(s);
+			if (!Number.isNaN(num)) {
+				const u32 = (num >>> 0);
+				variants.add(String(num));
+				variants.add(String(u32));
+				variants.add(u32.toString(16).toUpperCase());
+				variants.add(num.toString(16).toUpperCase());
+			}
+			// hex-like variants
+			const hexLike = s.match(/^[0-9A-Fa-f]{8,}$/) ? s : s.replace(/[^0-9A-Fa-f]/g, '');
+			if (hexLike && /^[0-9A-Fa-f]{8,}$/.test(hexLike)) {
+				const up = hexLike.toUpperCase();
+				variants.add(up);
+				const lowHex = up.slice(-8);
+				try { variants.add(String(parseInt(lowHex, 16))); } catch(_) {}
+				variants.add(lowHex);
+			}
+			for (const k of variants) { if (names[k]) return names[k]; }
+			return null;
+		} catch {
+			return null;
+		}
+	};
 
 	// Invia comando di test
 	const handleTestCommand = () => {
@@ -130,7 +174,12 @@ const Verge3DControl = () => {
 								if (employee) {
 									entityName = employee.name;
 									entityType = 'employee';
-								}
+														}
+														// Fallback: show device name if provided by engine (tagNames)
+														if (entityName === 'Non assegnato') {
+															const nm = resolveName(tagId);
+															if (nm) entityName = nm;
+														}
 							} else if (association.targetType === 'asset') {
 								const asset = assets.find((a) => a.id === association.targetId);
 								if (asset) {

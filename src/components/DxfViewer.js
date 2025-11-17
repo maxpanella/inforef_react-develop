@@ -7,55 +7,46 @@ import DxfParser from "dxf-parser";
 export function DxfViewer({
   data,
   width = "100%",
-  height = "400px",
   tagPositions = {},
   debugRawPositions = {},
   showTagsMessage = true,
-  anchors = [], // Predisposizione per le ancore BlueIOT
-  onTagClick = null, // callback(click) -> tagId
-  onMapClick = null, // callback(click) -> {x, y}
-  onNormalizationChange = null, // callback(ns) quando la mappa viene normalizzata
-  focusPoint = null, // {x,y,ts} opzionale per centrare vista su un punto
-  onBoundsChange = null, // callback(boundsRaw) con {min:{x,y}, max:{x,y}} in unità raw DXF (prima della normalizzazione)
+  anchors = [], 
+  onTagClick = null, 
+  onMapClick = null,
+  onNormalizationChange = null, 
+  focusPoint = null, 
+  onBoundsChange = null, 
 }) {
   const containerRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
   const controlsRef = useRef(null);
-  const animationFrameRef = useRef(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  // Persistenza camera
   const CAM_STORAGE_KEY = 'dxfViewerCamera_v1';
   const restoreAttemptedRef = useRef(false);
   const saveDebounceRef = useRef(null);
 
   // Gruppo per i tag
   const tagsRef = useRef(null);
-
-  // Gruppo per le ancore
   const anchorsRef = useRef(null);
 
   // Gruppo overlay per elementi della mappa (contorni) e fattore di normalizzazione
   const overlayRef = useRef(null);
   const normScaleRef = useRef(1);
 
-  // Rettangolo di delimitazione della mappa
-  const mapBoundsRef = useRef({
-    min: { x: 0, y: 0 },
-    max: { x: 100, y: 100 },
-  });
-
-  // Mappa per tenere traccia dei marker dei tag
+  // Rettangolo di delimitazione della mappa e riferimenti ai marker
+  const mapBoundsRef = useRef({ min: { x: 0, y: 0 }, max: { x: 100, y: 100 } });
   const tagMarkersRef = useRef({});
-  // Mappa per marker RAW di debug
   const rawMarkersRef = useRef({});
-
-  // Raycaster per click / hover
-  const raycasterRef = useRef(new THREE.Raycaster());
   const pointerRef = useRef(new THREE.Vector2());
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const animationFrameRef = useRef(null);
+  // Stato interno per follow: conserva distanza iniziale dalla camera al target quando si attiva
+  const followStateRef = useRef({ active: false, baseDist: null, lastTarget: null });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
   const [hoverTagId, setHoverTagId] = useState(null);
+  const [exitNotice, setExitNotice] = useState(null);
   const markerPixelSize = 12; // diametro desiderato in pixel
 
   // Inizializza il renderer Three.js
@@ -103,11 +94,11 @@ export function DxfViewer({
       cameraRef.current = camera;
 
       // Inizializza il renderer con alta qualità
-      const renderer = new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: true,
-        preserveDrawingBuffer: true,
-      });
+        const renderer = new THREE.WebGLRenderer({
+          antialias: true,
+          alpha: true,
+          preserveDrawingBuffer: true,
+        });
       renderer.setSize(width, height);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     containerEl.appendChild(renderer.domElement);
@@ -308,6 +299,10 @@ export function DxfViewer({
       setLoading(false);
     }
   }, []);
+  // Alias compatibilità: `tagPositions` era usato in versioni precedenti del componente.
+  // Manteniamo una variabile locale derivata da `data` per evitare ReferenceError se il codice la usa.
+  // `tagPositions` is provided by parent when available (real-time positions).
+  // Keep `data` for DXF content; do not alias `data` to tagPositions.
 
   // Conversione coordinate mappa -> mondo (qui identità perché il gruppo tag viene scalato come la mappa)
   const toWorld = (x, y) => ({ x, y });
@@ -430,36 +425,43 @@ export function DxfViewer({
         delete rawMarkersRef.current[tagId];
       }
     });
-    // Aggiorna o crea RAW markers (debug)
-    if (debugRawPositions) {
-      Object.entries(debugRawPositions).forEach(([tagId, info]) => {
-        try {
-          const world = toWorld(info.x, info.y);
-          if (rawMarkersRef.current[tagId]) {
-            const grp = rawMarkersRef.current[tagId];
-            grp.position.set(world.x, world.y, 12);
-            return;
+    // Se stiamo seguendo un tag (focusPoint attivo), nascondi i raw debug markers per evitare confusione
+    if (focusPoint) {
+      Object.values(rawMarkersRef.current).forEach((g) => { try { g.visible = false; } catch(_) {} });
+      // Non creare nuovi raw markers quando siamo in modalità follow
+    } else {
+      // Aggiorna o crea RAW markers (debug)
+      if (debugRawPositions) {
+        Object.entries(debugRawPositions).forEach(([tagId, info]) => {
+          try {
+            const world = toWorld(info.x, info.y);
+            if (rawMarkersRef.current[tagId]) {
+              const grp = rawMarkersRef.current[tagId];
+              grp.visible = true;
+              grp.position.set(world.x, world.y, 12);
+              return; // skip creation for this entry
+            }
+            const arm = 2;
+            const thickness = 0.5;
+            const g1 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
+            const g2 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
+            const mat = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+            const b1 = new THREE.Mesh(g1, mat);
+            const b2 = new THREE.Mesh(g2, mat);
+            b1.rotation.z = Math.PI / 4;
+            b2.rotation.z = -Math.PI / 4;
+            const group = new THREE.Group();
+            group.add(b1);
+            group.add(b2);
+            group.position.set(world.x, world.y, 12);
+            group.userData = { tagId, isRawDebug: true };
+            tagsRef.current.add(group);
+            rawMarkersRef.current[tagId] = group;
+          } catch (err) {
+            console.error(`Errore creazione RAW marker per tag ${tagId}:`, err);
           }
-          const arm = 2;
-          const thickness = 0.5;
-          const g1 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
-          const g2 = new THREE.BoxGeometry(arm * 2, thickness, thickness);
-          const mat = new THREE.MeshBasicMaterial({ color: 0xff00ff });
-          const b1 = new THREE.Mesh(g1, mat);
-          const b2 = new THREE.Mesh(g2, mat);
-          b1.rotation.z = Math.PI / 4;
-          b2.rotation.z = -Math.PI / 4;
-          const group = new THREE.Group();
-          group.add(b1);
-          group.add(b2);
-          group.position.set(world.x, world.y, 12);
-          group.userData = { tagId, isRawDebug: true };
-          tagsRef.current.add(group);
-          rawMarkersRef.current[tagId] = group;
-        } catch (err) {
-          console.error(`Errore creazione RAW marker per tag ${tagId}:`, err);
-        }
-      });
+        });
+      }
     }
   }, [tagPositions, debugRawPositions]);
 
@@ -747,7 +749,22 @@ export function DxfViewer({
                     p.y >= b.min.y - marginY && p.y <= b.max.y + marginY
                   );
                 };
-                if (within(saved.pos) && within(saved.target)) {
+                // Only restore saved camera if saved.normScale is compatible with current normalization
+                const savedNorm = saved && saved.normScale ? Number(saved.normScale) : null;
+                const currentNorm = normScaleRef.current || 1;
+                let normCompatible = true;
+                try {
+                  if (savedNorm && isFinite(savedNorm) && savedNorm > 0) {
+                    const ratio = savedNorm / currentNorm;
+                    // allow some tolerance: reject if the saved map scale differs too much
+                    if (ratio < 0.6 || ratio > 1.7) {
+                      normCompatible = false;
+                      console.warn('[DxfViewer] saved camera skipped: saved.normScale incompatible (saved=', savedNorm, 'current=', currentNorm, ')');
+                    }
+                  }
+                } catch (_) { /* ignore */ }
+
+                if (within(saved.pos) && within(saved.target) && normCompatible) {
                   if (cameraRef.current && controlsRef.current) {
                     cameraRef.current.position.set(saved.pos.x, saved.pos.y, saved.pos.z);
                     controlsRef.current.target.set(saved.target.x, saved.target.y, saved.target.z || 0);
@@ -756,11 +773,17 @@ export function DxfViewer({
                     restored = true;
                     console.log('[DxfViewer] Camera ripristinata da localStorage');
                   }
+                } else if (!normCompatible) {
+                  // if within-check passed but norm is incompatible we still avoid restoring
+                  restored = false;
                 }
               }
             }
           } catch(e) { console.warn('[DxfViewer] Ripristino camera fallito:', e.message); }
-          if (!restored) centerView();
+          if (!restored) {
+            console.warn('[DxfViewer] saved camera not usable, centering view');
+            centerView();
+          }
         } else {
           centerView();
         }
@@ -796,7 +819,6 @@ export function DxfViewer({
   try { if (onBoundsChange) onBoundsChange({ ...mapBoundsRef.current }); } catch(_) {}
 
       // Aggiorna la posizione dei marker se il fattore di normalizzazione cambia (ricalcolo semplice)
-      const ns = normScaleRef.current || 1;
       Object.entries(tagMarkersRef.current).forEach(([tagId, marker]) => {
         // Le posizioni originali non le abbiamo salvate qui: assumiamo che la posizione corrente sia già world.
         // Se volessimo una riconversione accurata dovremmo memorizzare gli x,y raw; per ora niente modifiche.
@@ -1131,8 +1153,9 @@ export function DxfViewer({
     const mapSize = new THREE.Vector3();
     mapBox.getCenter(mapCenter);
     mapBox.getSize(mapSize);
-    const mapDiag = Math.sqrt(mapSize.x * mapSize.x + mapSize.y * mapSize.y) || 1;
-  const safeRadius = mapDiag * 3; // ignora outlier molto lontani
+    // Usa un'area di riferimento più conservativa: espandi la mappa solo del 20% per includere tag vicini
+    const expansion = Math.max(mapSize.x, mapSize.y) * 0.2;
+    const expandedMapBox = mapBox.clone().expandByScalar(expansion);
 
     // 2) Costruisci bounding combinato: mappa + tag entro raggio sicuro
     const box = mapBox.clone();
@@ -1142,7 +1165,8 @@ export function DxfViewer({
         tmpBox.setFromObject(c);
         const childCenter = new THREE.Vector3();
         tmpBox.getCenter(childCenter);
-        if (childCenter.distanceTo(mapCenter) <= safeRadius) {
+        // includi il marker solo se ricade entro l'area mappa espansa (evita outlier molto lontani)
+        if (expandedMapBox.containsPoint(childCenter)) {
           box.union(tmpBox);
         }
       });
@@ -1160,47 +1184,530 @@ export function DxfViewer({
   // Stili per il container
   const containerStyle = {
     width,
-    height,
+    height: '100%',
     position: "relative",
     border: "1px solid #e0e0e0",
     borderRadius: "4px",
     overflow: "hidden",
   };
 
+  // Debug panel state (quiet UI instead of console spam)
+  const [debugPanel, setDebugPanel] = useState(null);
+  useEffect(() => {
+    let intervalId = null;
+    const update = () => {
+      try {
+        if (typeof window !== 'undefined' && !window.__DXF_DEBUG_PANEL) return;
+        const cam = cameraRef.current;
+        const controls = controlsRef.current;
+        const b = mapBoundsRef.current;
+        let dims = null;
+        if (b) {
+          const sizeX = Math.abs(b.max.x - b.min.x) || 0;
+          const sizeY = Math.abs(b.max.y - b.min.y) || 0;
+          dims = { sizeX, sizeY };
+        }
+        let mapInView = null;
+        try {
+          if (cam && sceneRef.current) {
+            cam.updateMatrixWorld();
+            const proj = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+            const frustum = new THREE.Frustum();
+            frustum.setFromProjectionMatrix(proj);
+            const mapBox = new THREE.Box3();
+            sceneRef.current.traverse((child) => {
+              if (child.userData && child.userData.isDxf) mapBox.expandByObject(child);
+            });
+            if (!mapBox.isEmpty()) mapInView = frustum.intersectsBox(mapBox);
+          }
+        } catch(_) {}
+        const dist = (cam && controls) ? (cam.position.z - (controls.target?.z || 0)) : null;
+        setDebugPanel({
+          followActive: !!(followStateRef.current && followStateRef.current.active),
+          lastExit: (typeof window !== 'undefined' && window.__DXF_EXIT_REASON) || null,
+          cam: cam ? { x: cam.position.x, y: cam.position.y, z: cam.position.z } : null,
+          target: controls ? { x: controls.target.x, y: controls.target.y } : null,
+          dist,
+          mapInView,
+          dims,
+        });
+      } catch(_) {}
+    };
+    if (typeof window !== 'undefined' && window.__DXF_DEBUG_PANEL) {
+      update();
+      intervalId = setInterval(update, 500);
+    }
+    return () => { if (intervalId) clearInterval(intervalId); };
+  }, [focusPoint]);
+
   // Focus esterno: centra la vista su un punto mantenendo lo zoom attuale
   useEffect(() => {
-    if (!focusPoint || !controlsRef.current || !cameraRef.current) return;
+    // Disattivato follow: ripristina stato interno e non toccare la camera
+    if (!focusPoint) {
+      followStateRef.current.active = false;
+      followStateRef.current.baseDist = null;
+      followStateRef.current.lastTarget = null;
+      return;
+    }
+    if (!controlsRef.current || !cameraRef.current) return;
+    // Allow external force-exit of follow mode via console: set window.__DXF_EXIT_FOLLOW = true
     try {
-      const target = new THREE.Vector3(Number(focusPoint.x) || 0, Number(focusPoint.y) || 0, 0);
+      if (typeof window !== 'undefined' && window.__DXF_EXIT_FOLLOW) {
+        followStateRef.current.active = false;
+        followStateRef.current.baseDist = null;
+        followStateRef.current.lastTarget = null;
+        try { delete window.__DXF_EXIT_FOLLOW; } catch(_) { window.__DXF_EXIT_FOLLOW = false; }
+        console.info('[DxfViewer] follow aborted via window.__DXF_EXIT_FOLLOW');
+        return;
+      }
+    } catch(_) {}
+    try {
       const cam = cameraRef.current;
       const controls = controlsRef.current;
-      // Evita di seguire target fuori dai confini (con un margine): se fuori, ignora
       const b = mapBoundsRef.current;
+
+      const safeNum = (v, def = 0) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : def;
+      };
+      const isReasonable = (n) => Number.isFinite(n) && Math.abs(n) < 1e6;
+
+      const rx = safeNum(focusPoint.x, NaN);
+      const ry = safeNum(focusPoint.y, NaN);
+      const rawTarget = new THREE.Vector3(rx, ry, 0);
+
+      // If coords are not reasonable, abort follow and use last-good fallback
+      if (!isReasonable(rawTarget.x) || !isReasonable(rawTarget.y)) {
+        console.warn('[DxfViewer][follow] invalid focusPoint coordinates, aborting follow', rawTarget);
+        try {
+          window.__DXF_FOLLOW_DIAG = { reason: 'invalid_coords', rawTarget: rawTarget, cam: cam && { x: cam.position.x, y: cam.position.y, z: cam.position.z } };
+          window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+          window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'invalid_coords', rawTarget: rawTarget, cam: cam && { x: cam.position.x, y: cam.position.y, z: cam.position.z } });
+          if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+        } catch(_) {}
+        try {
+          const notice = { reason: 'invalid_coords', msg: 'Coordinate non valide ricevute — follow interrotto', ts: Date.now() };
+          setExitNotice(notice);
+          try { window.__DXF_EXIT_REASON = notice; } catch(_) {}
+          setTimeout(() => { try { setExitNotice(null); } catch(_) {} }, 6000);
+        } catch(_) {}
+        // attempt to fallback to last known good target if available
+        const lastGood = followStateRef.current.lastGoodTarget;
+        if (lastGood) {
+          try { controls.target.copy(lastGood); controls.update(); } catch(_) {}
+        } else {
+          centerIncludingTags();
+        }
+        followStateRef.current.active = false;
+        followStateRef.current.baseDist = null;
+        return;
+      }
+
+      let target = rawTarget.clone();
       if (b) {
         const sizeX = Math.abs(b.max.x - b.min.x) || 1;
         const sizeY = Math.abs(b.max.y - b.min.y) || 1;
-        const marginX = sizeX * 0.15; // 15% margine
-        const marginY = sizeY * 0.15;
-        const within = (p) => (
-          p.x >= (b.min.x - marginX) && p.x <= (b.max.x + marginX) &&
-          p.y >= (b.min.y - marginY) && p.y <= (b.max.y + marginY)
-        );
-        if (!within(target)) {
-          // Non spostare la camera fuori dalla planimetria
+        const marginX = sizeX * 0.10;
+        const marginY = sizeY * 0.10;
+        const minX = b.min.x - marginX, maxX = b.max.x + marginX;
+        const minY = b.min.y - marginY, maxY = b.max.y + marginY;
+        target.x = Math.max(minX, Math.min(maxX, target.x));
+        target.y = Math.max(minY, Math.min(maxY, target.y));
+      }
+
+      // ensure target is finite after clamping
+      if (!isReasonable(target.x) || !isReasonable(target.y)) {
+        console.warn('[DxfViewer][follow] target out of reasonable range after clamping', target);
+        try {
+          window.__DXF_FOLLOW_DIAG = { reason: 'clamp_invalid', rawTarget: rawTarget, targetClamped: target };
+          window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+          window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'clamp_invalid', rawTarget: rawTarget, targetClamped: target });
+          if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+        } catch(_) {}
+        try {
+          const notice = { reason: 'clamp_invalid', msg: 'Target invalido dopo il clamp — follow interrotto', ts: Date.now() };
+          setExitNotice(notice);
+          try { window.__DXF_EXIT_REASON = notice; } catch(_) {}
+          setTimeout(() => { try { setExitNotice(null); } catch(_) {} }, 6000);
+        } catch(_) {}
+        followStateRef.current.active = false;
+        followStateRef.current.baseDist = null;
+        centerIncludingTags();
+        return;
+      }
+
+      // If the marker disappears, stop follow
+      const markerExists = tagMarkersRef.current && Object.values(tagMarkersRef.current).some(m => Math.abs(m.position.x - target.x) < 0.01 && Math.abs(m.position.y - target.y) < 0.01);
+      if (!markerExists) {
+        followStateRef.current.active = false;
+        followStateRef.current.baseDist = null;
+        followStateRef.current.lastTarget = null;
+        console.warn('[DxfViewer][follow] marker assente, uscita da follow e centerIncludingTags');
+        centerIncludingTags();
+        try {
+          window.__DXF_FOLLOW_DIAG = { reason: 'marker_missing', rawTarget, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z } };
+          window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+          window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'marker_missing', rawTarget, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z } });
+          if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+        } catch(_) {}
+        return;
+      }
+
+      if (!followStateRef.current.active) {
+        followStateRef.current.active = true;
+        let mapFitDist = 60;
+        try {
+          if (b) {
+            const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+            const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+            const maxDim = Math.max(sizeX, sizeY) || 1;
+            const fov = cam.fov * Math.PI / 180;
+            mapFitDist = Math.max(10, (maxDim / (2 * Math.tan(fov/2))) * 1.25);
+          }
+        } catch(_) {}
+        const factor = (typeof window !== 'undefined' && Number.isFinite(window.__DXF_FOLLOW_DISTANCE_FACTOR)) ? window.__DXF_FOLLOW_DISTANCE_FACTOR : 1.10;
+        const initialDist = Math.max(10, mapFitDist * factor);
+        followStateRef.current.baseDist = initialDist;
+        // Position camera directly relative to target (no legacy z usage)
+        try {
+          cam.position.set(target.x, target.y, initialDist);
+          controls.target.copy(target);
+          cam.lookAt(controls.target);
+          cam.updateProjectionMatrix();
+          controls.update();
+        } catch(_) {}
+        followStateRef.current.lastTarget = target.clone();
+        followStateRef.current.lastGoodTarget = target.clone();
+        followStateRef.current.lastGoodCameraPos = cam.position.clone();
+        window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+        window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'follow_activation', mapFitDist, appliedDist: initialDist, factor });
+        if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+        try {
+          if (typeof window !== 'undefined' && !window.__DXF_EXPORT_FOLLOW) {
+            window.__DXF_EXPORT_FOLLOW = () => ({ diag: window.__DXF_FOLLOW_DIAG, log: (window.__DXF_FOLLOW_LOG||[]) });
+          }
+        } catch(_) {}
+      }
+
+      const lastT = followStateRef.current.lastTarget;
+      if (lastT && lastT.distanceTo(target) < 0.05) return;
+      followStateRef.current.lastTarget = target.clone();
+
+      let dist = safeNum(cam.position.z - (controls.target?.z || 0), followStateRef.current.baseDist || 60);
+      const base = followStateRef.current.baseDist || dist || 60;
+      if (!isReasonable(dist)) dist = base;
+      // tighter clamp relative to base to prevent runaway zoom
+      if (dist > base * 1.6) dist = base;
+      else if (dist < base * 0.6) dist = base;
+
+      if (b) {
+        const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+        const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+        const maxDim = Math.max(sizeX, sizeY) || 1;
+        const fov = cam.fov * Math.PI / 180;
+        const desired = Math.max(10, (maxDim / (2 * Math.tan(fov/2))) * 1.2);
+        if (dist > desired * 1.8) dist = desired * 1.2;
+        if (dist < desired * 0.4) dist = desired * 0.9;
+
+        // Ulteriore clamp: evita zoom out eccessivi rispetto alla dimensione della mappa
+        let minClamp = Math.max(10, Math.min(base * 0.3, desired * 0.5));
+        let maxClamp = Math.max(desired * 1.5, Math.min(base * 3, desired * 3));
+        if (!isReasonable(minClamp) || minClamp <= 0) minClamp = 10;
+        if (!isReasonable(maxClamp) || maxClamp <= 0) maxClamp = Math.max(100, desired * 2);
+        dist = Math.max(Math.min(dist, maxClamp), minClamp);
+
+        // Smoothly steer distance toward a stable map-fit distance so the map doesn't appear huge
+        try {
+          const factor = (typeof window !== 'undefined' && Number.isFinite(window.__DXF_FOLLOW_DISTANCE_FACTOR)) ? window.__DXF_FOLLOW_DISTANCE_FACTOR : 1.15; // slightly above fit
+          const targetDist = Math.max(10, desired * factor);
+          const alphaDist = 0.15; // gentle convergence
+          const distNext = dist + (targetDist - dist) * alphaDist;
+          // ensure distNext stays within clamps
+          if (isReasonable(distNext)) {
+            const lower = desired * 0.7;
+            const upper = desired * 1.6;
+            dist = Math.min(Math.max(distNext, lower), upper);
+          }
+        } catch(_) {}
+      }
+
+      // hard safety cap for dist
+      dist = Math.max(10, Math.min(dist, 1e5));
+
+      // Safety: se il target è molto al di fuori dei confini della mappa, evita di spostare la camera
+      if (b) {
+        const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+        const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+        const marginX = sizeX * 0.10;
+        const marginY = sizeY * 0.10;
+        const extremeFactor = 2.0; // quanto fuori dai bordi consideriamo 'estremo'
+        const tooFarX = (target.x < (b.min.x - marginX * extremeFactor)) || (target.x > (b.max.x + marginX * extremeFactor));
+        const tooFarY = (target.y < (b.min.y - marginY * extremeFactor)) || (target.y > (b.max.y + marginY * extremeFactor));
+        if (tooFarX || tooFarY) {
+          // disattiva follow e ripristina vista sui tag noti
+          followStateRef.current.active = false;
+          followStateRef.current.baseDist = null;
+          followStateRef.current.lastTarget = null;
+          console.warn('[DxfViewer][follow] target troppo lontano dai confini della mappa, uscita da follow');
+          centerIncludingTags();
+          try {
+            window.__DXF_FOLLOW_DIAG = { reason: 'target_out_of_bounds', rawTarget: rawTarget, targetClamped: target, distApplied: dist, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z } };
+            window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+            window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'out_of_bounds', rawTarget: rawTarget, targetClamped: target, distApplied: dist, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z } });
+            if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+          } catch(_) {}
+          try {
+            const notice = { reason: 'target_out_of_bounds', msg: 'Target fuori dai confini della mappa — follow interrotto', ts: Date.now() };
+            setExitNotice(notice);
+            try { window.__DXF_EXIT_REASON = notice; } catch(_) {}
+            setTimeout(() => { try { setExitNotice(null); } catch(_) {} }, 6000);
+          } catch(_) {}
           return;
         }
       }
-      // Pan verso il target mantenendo lo zoom
-      const prevTarget = controls.target.clone();
-      const camOffset = cam.position.clone().sub(prevTarget);
+
       controls.target.copy(target);
-      cam.position.copy(target.clone().add(camOffset));
-      cam.lookAt(target);
-      cam.updateProjectionMatrix();
-      controls.update();
+      if (followStateRef.current.active && !controls.__followConfigured) {
+        const allowZoom = (typeof window !== 'undefined' && !!window.__DXF_FOLLOW_ALLOW_ZOOM);
+        controls.enableZoom = allowZoom ? true : false;
+        // keep zoom range tight around current dist to avoid extreme wheel effects
+        controls.minDistance = Math.max(5, dist * 0.8);
+        controls.maxDistance = Math.max(10, dist * 1.4);
+        controls.__followConfigured = true;
+      } else if (followStateRef.current.active) {
+        // update bounds every step to track dist evolution
+        const allowZoom = (typeof window !== 'undefined' && !!window.__DXF_FOLLOW_ALLOW_ZOOM);
+        controls.enableZoom = allowZoom ? true : false;
+        controls.minDistance = Math.max(5, dist * 0.8);
+        controls.maxDistance = Math.max(10, dist * 1.4);
+      }
+
+      // Offset laterale per mantenere contesto (evita vista ortogonale troppo stretta)
+      let posX = target.x, posY = target.y;
+      if (b) {
+        const sizeX = Math.abs(b.max.x - b.min.x) || 1;
+        const sizeY = Math.abs(b.max.y - b.min.y) || 1;
+        // Clamp offset with user-adjustable maximum (window.__DXF_MAX_OFFSET or default 300)
+        let maxOff = 300;
+        try { if (typeof window !== 'undefined' && Number.isFinite(window.__DXF_MAX_OFFSET)) maxOff = window.__DXF_MAX_OFFSET; } catch(_) {}
+        const rawOffsetX = sizeX * 0.15;
+        const rawOffsetY = sizeY * 0.15;
+        const offX = Math.sign(rawOffsetX) * Math.min(Math.abs(rawOffsetX), maxOff);
+        const offY = Math.sign(rawOffsetY) * Math.min(Math.abs(rawOffsetY), maxOff);
+        posX = target.x + offX;
+        posY = target.y - offY;
+        // Detect camera drift: if camera too far from allowed offset, snap closer before smoothing
+        try {
+          const dx = Math.abs(cam.position.x - (target.x + offX));
+          const dy = Math.abs(cam.position.y - (target.y - offY));
+          const driftThresh = maxOff * 2.5; // generous threshold
+          if (dx > driftThresh || dy > driftThresh) {
+            console.warn('[DxfViewer][follow] camera drift detected, realigning', { dx, dy, driftThresh });
+            cam.position.x = target.x + offX;
+            cam.position.y = target.y - offY;
+            followStateRef.current.lastGoodCameraPos = cam.position.clone();
+          }
+        } catch(_) {}
+        // store latest map dims for diagnostics
+        followStateRef.current._latestMapDims = { sizeX, sizeY, maxOffsetApplied: maxOff };
+      }
+      // Smoothly move camera towards desired position instead of instant jump
+      try {
+        const desiredZ = (target.z || 0) + dist;
+        const desiredPos = new THREE.Vector3(posX, posY, desiredZ);
+        // validate desiredPos
+        if (!isReasonable(desiredPos.x) || !isReasonable(desiredPos.y) || !isReasonable(desiredPos.z)) {
+          console.warn('[DxfViewer][follow] desiredPos invalid, using last good camera pos', desiredPos);
+          const lastGood = followStateRef.current.lastGoodCameraPos || cam.position.clone();
+          try { cam.position.lerp(lastGood, 0.5); controls.update(); } catch(_) {}
+        } else {
+          // Hard z-drift correction: if current z is far from desired (e.g., user wheel), snap closer
+          try {
+            const zDrift = Math.abs(cam.position.z - desiredZ);
+            const zThresh = Math.max(50, dist * 2);
+            if (zDrift > zThresh) {
+              cam.position.z = desiredZ;
+            }
+          } catch(_) {}
+          const cur = cam.position.clone();
+          const alpha = 0.45;
+          const nextPos = new THREE.Vector3(
+            cur.x + (desiredPos.x - cur.x) * alpha,
+            cur.y + (desiredPos.y - cur.y) * alpha,
+            cur.z + (desiredPos.z - cur.z) * alpha
+          );
+          // guard nextPos
+          if (isReasonable(nextPos.x) && isReasonable(nextPos.y) && isReasonable(nextPos.z)) {
+            cam.position.copy(nextPos);
+            followStateRef.current.lastGoodCameraPos = cam.position.clone();
+            followStateRef.current.lastGoodTarget = target.clone();
+          } else {
+            console.warn('[DxfViewer][follow] nextPos contained invalid numbers, skipping apply', nextPos);
+          }
+          // Smooth target update as well
+          const curTarget = controls.target.clone();
+          const nextTarget = new THREE.Vector3(
+            curTarget.x + (target.x - curTarget.x) * alpha,
+            curTarget.y + (target.y - curTarget.y) * alpha,
+            0
+          );
+          if (isReasonable(nextTarget.x) && isReasonable(nextTarget.y)) controls.target.copy(nextTarget);
+          cam.lookAt(controls.target);
+          cam.updateProjectionMatrix();
+          try { controls.update(); } catch(_) {}
+        }
+      } catch (e) {
+        // fallback to immediate set if anything fails
+        console.warn('[DxfViewer][follow] exception while moving camera:', e?.message);
+        try {
+          cam.position.set(posX, posY, (target.z || 0) + dist);
+          cam.lookAt(target);
+          cam.updateProjectionMatrix();
+          controls.update();
+        } catch(_) {
+          // last-resort: center view
+          centerIncludingTags();
+        }
+      }
+
       adjustFarForMap();
-    } catch(_) {}
+      try {
+        const dims = followStateRef.current._latestMapDims || null;
+        let mapInView = null;
+        try {
+          if (b && cam) {
+            cam.updateMatrixWorld();
+            const proj = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+            const frustum = new THREE.Frustum();
+            frustum.setFromProjectionMatrix(proj);
+            const box = new THREE.Box3(
+              new THREE.Vector3(b.min.x, b.min.y, -1),
+              new THREE.Vector3(b.max.x, b.max.y, 1)
+            );
+            mapInView = frustum.intersectsBox(box);
+          }
+        } catch(_) {}
+
+        window.__DXF_FOLLOW_DIAG = { rawTarget: rawTarget, targetClamped: target, distApplied: dist, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z }, mapDims: dims, mapInView };
+        window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+        window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'follow_step', rawTarget: rawTarget, targetClamped: target, distApplied: dist, cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z }, mapDims: dims, mapInView });
+        if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+
+        // Auto-recover if map stays out of view for a short duration
+        try {
+          if (mapInView === false) {
+            const now = Date.now();
+            const thresh = (typeof window !== 'undefined' && Number.isFinite(window.__DXF_AUTORECOVER_MS)) ? window.__DXF_AUTORECOVER_MS : 400;
+            if (!followStateRef.current._outOfViewSince) {
+              followStateRef.current._outOfViewSince = now;
+            } else if ((now - followStateRef.current._outOfViewSince) > thresh) {
+              const desiredZ2 = (target.z || 0) + dist;
+              cam.position.x = isReasonable(posX) ? posX : cam.position.x;
+              cam.position.y = isReasonable(posY) ? posY : cam.position.y;
+              cam.position.z = isReasonable(desiredZ2) ? desiredZ2 : cam.position.z;
+              controls.target.copy(target);
+              cam.lookAt(controls.target);
+              cam.updateProjectionMatrix();
+              try { controls.update(); } catch(_) {}
+              followStateRef.current.lastGoodCameraPos = cam.position.clone();
+              followStateRef.current._outOfViewSince = null;
+              window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'auto_recover_out_of_view', cam: { x: cam.position.x, y: cam.position.y, z: cam.position.z }, target: { x: target.x, y: target.y }, distApplied: dist });
+              if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+            }
+          } else {
+            followStateRef.current._outOfViewSince = null;
+          }
+        } catch(_) {}
+
+        // Gate console spam behind verbose flag
+        try { if (typeof window !== 'undefined' && window.__DXF_FOLLOW_VERBOSE && typeof console !== 'undefined') console.info('[Follow] step:', window.__DXF_FOLLOW_DIAG); } catch(_) {}
+      } catch(_) {}
+      try { console.debug('[DxfViewer][follow3] target=', target, 'baseDist=', base, 'appliedDist=', dist, 'camPos=', cam.position); } catch(_) {}
+    } catch(e) {
+      console.warn('[DxfViewer] follow3 error:', e?.message);
+    }
   }, [focusPoint]);
+
+  // Visibility sentinel (smooth recovery): keeps map in view without hard flicker
+  useEffect(() => {
+    let rafId = null;
+    let missCount = 0;
+    let recovering = false;
+    let recoverProgress = 0;
+    const tick = () => {
+      try {
+        const cam = cameraRef.current;
+        const controls = controlsRef.current;
+        const scene = sceneRef.current;
+        if (cam && scene) {
+          cam.updateMatrixWorld();
+          const proj = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+          const frustum = new THREE.Frustum();
+          frustum.setFromProjectionMatrix(proj);
+            const box = new THREE.Box3();
+            scene.traverse((child) => { if (child.userData && child.userData.isDxf) box.expandByObject(child); });
+            if (!box.isEmpty()) {
+              const inView = frustum.intersectsBox(box);
+              const maxMiss = (typeof window !== 'undefined' && Number.isFinite(window.__DXF_SENTINEL_MAX_MISS)) ? window.__DXF_SENTINEL_MAX_MISS : 20;
+              if (!inView) {
+                missCount++;
+                if (missCount === 1) {
+                  window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+                  window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'sentinel_miss_start' });
+                  if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+                }
+                if (missCount > maxMiss && !recovering) {
+                  // Setup smooth recovery target (map center + fit distance)
+                  const size = new THREE.Vector3(); box.getSize(size);
+                  const center = new THREE.Vector3(); box.getCenter(center);
+                  const maxDim = Math.max(size.x, size.y) || 1;
+                  const fov = cam.fov * Math.PI / 180;
+                  let fitDist = Math.max(10, (maxDim / (2 * Math.tan(fov/2))) * 1.25);
+                  const factor = (typeof window !== 'undefined' && Number.isFinite(window.__DXF_FOLLOW_DISTANCE_FACTOR)) ? window.__DXF_FOLLOW_DISTANCE_FACTOR : 1.10;
+                  fitDist *= factor;
+                  followStateRef.current._recoverTarget = { center, dist: fitDist };
+                  recovering = true;
+                  recoverProgress = 0;
+                  window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+                  window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'sentinel_soft_recover_start', misses: missCount, fitDist });
+                  if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+                }
+              } else {
+                if (missCount > 0) {
+                  window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+                  window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'sentinel_recovered', misses: missCount });
+                  if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+                }
+                missCount = 0;
+                recovering = false;
+              }
+              // Perform smooth recovery lerp
+              if (recovering && followStateRef.current._recoverTarget) {
+                recoverProgress += 0.08; // speed
+                const { center, dist } = followStateRef.current._recoverTarget;
+                const desiredPos = new THREE.Vector3(center.x, center.y, dist);
+                const alpha = Math.min(1, recoverProgress);
+                cam.position.lerp(desiredPos, alpha);
+                try { controls.target.lerp(new THREE.Vector3(center.x, center.y, 0), alpha); } catch(_) {}
+                cam.lookAt(controls.target);
+                cam.updateProjectionMatrix();
+                try { controls.update(); } catch(_) {}
+                if (alpha >= 1) {
+                  recovering = false;
+                  followStateRef.current._recoverTarget = null;
+                  window.__DXF_FOLLOW_LOG = window.__DXF_FOLLOW_LOG || [];
+                  window.__DXF_FOLLOW_LOG.push({ ts: Date.now(), kind: 'sentinel_soft_recover_done' });
+                  if (window.__DXF_FOLLOW_LOG.length > 200) window.__DXF_FOLLOW_LOG.shift();
+                }
+              }
+            }
+        }
+      } catch(_) {}
+      rafId = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => { if (rafId) cancelAnimationFrame(rafId); };
+  }, []);
 
   return (
     <div style={containerStyle} ref={containerRef}>
@@ -1396,6 +1903,74 @@ export function DxfViewer({
               </div>
             );
           })}
+        </div>
+      )}
+      {/* Diagnostics follow overlay */}
+      {focusPoint && typeof window !== 'undefined' && window.__DXF_FOLLOW_DIAG && (
+        (() => {
+          const d = window.__DXF_FOLLOW_DIAG;
+          return (
+            <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-white bg-opacity-95 shadow-lg rounded-md px-3 py-2 z-40 text-[10px] w-[300px]">
+              <div className="font-semibold mb-1">Follow Diagnostics</div>
+              <div>Target raw: {d.rawTarget?.x?.toFixed ? d.rawTarget.x.toFixed(2) : String(d.rawTarget?.x ?? '')}, {d.rawTarget?.y?.toFixed ? d.rawTarget.y.toFixed(2) : String(d.rawTarget?.y ?? '')}</div>
+              <div>Target clamp: {d.targetClamped?.x?.toFixed ? d.targetClamped.x.toFixed(2) : String(d.targetClamped?.x ?? '')}, {d.targetClamped?.y?.toFixed ? d.targetClamped.y.toFixed(2) : String(d.targetClamped?.y ?? '')}</div>
+              <div>Camera: {d.cam?.x?.toFixed ? d.cam.x.toFixed(2) : String(d.cam?.x ?? '')}, {d.cam?.y?.toFixed ? d.cam.y.toFixed(2) : String(d.cam?.y ?? '')}, {d.cam?.z?.toFixed ? d.cam.z.toFixed(2) : String(d.cam?.z ?? '')}</div>
+              <div>Distanza applicata: {d.distApplied?.toFixed ? d.distApplied.toFixed(2) : String(d.distApplied ?? '')}</div>
+              {d.mapDims && (
+                <div>Map (X,Y): {(d.mapDims.sizeX||0).toFixed(1)}, {(d.mapDims.sizeY||0).toFixed(1)}</div>
+              )}
+              <div className="mt-1 text-[9px] text-gray-500">(Disabilitare: delete window.__DXF_FOLLOW_DIAG)</div>
+            </div>
+          );
+        })()
+      )}
+
+      {/* Quiet Debug Panel (toggle with window.__DXF_DEBUG_PANEL = true) */}
+      {typeof window !== 'undefined' && window.__DXF_DEBUG_PANEL && debugPanel && (
+        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-white bg-opacity-95 shadow-lg rounded-md px-3 py-2 z-40 text-[11px] w-[360px]">
+          <div className="font-semibold mb-1">Follow Status (Quiet)</div>
+          <div>Status: {debugPanel.followActive ? 'FOLLOW ON' : 'FOLLOW OFF'}{debugPanel.lastExit ? ` — last: ${debugPanel.lastExit.reason}` : ''}</div>
+          <div>Map in view: <span className={debugPanel.mapInView === false ? 'text-red-600' : 'text-green-700'}>{debugPanel.mapInView === false ? 'NO' : (debugPanel.mapInView === true ? 'YES' : 'N/A')}</span></div>
+          {debugPanel.dims && (
+            <div>Map size: {debugPanel.dims.sizeX.toFixed(1)} x {debugPanel.dims.sizeY.toFixed(1)}</div>
+          )}
+          {debugPanel.target && (
+            <div>Target: {debugPanel.target.x.toFixed(2)}, {debugPanel.target.y.toFixed(2)}</div>
+          )}
+          {debugPanel.cam && (
+            <div>Camera: {debugPanel.cam.x.toFixed(2)}, {debugPanel.cam.y.toFixed(2)}, {debugPanel.cam.z.toFixed(2)} (dist {debugPanel.dist?.toFixed ? debugPanel.dist.toFixed(2) : 'N/A'})</div>
+          )}
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => {
+                try {
+                  const payload = {
+                    diag: (typeof window !== 'undefined' ? window.__DXF_FOLLOW_DIAG : null),
+                    log: (typeof window !== 'undefined' ? (window.__DXF_FOLLOW_LOG||[]).slice(-200) : []),
+                    lastExit: (typeof window !== 'undefined' ? window.__DXF_EXIT_REASON : null),
+                    panel: debugPanel,
+                  };
+                  const s = JSON.stringify(payload, null, 2);
+                  if (navigator?.clipboard?.writeText) {
+                    navigator.clipboard.writeText(s);
+                  } else {
+                    const blob = new Blob([s], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = 'follow-diagnostics.json'; a.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                  }
+                } catch(_) {}
+              }}
+              className="bg-gray-200 hover:bg-gray-300 px-2 py-1 rounded"
+              title="Copia JSON diagnostica / Scarica"
+            >Copia/Scarica Snapshot</button>
+            <button
+              onClick={() => { try { centerIncludingTags(); } catch(_) {} }}
+              className="bg-gray-200 hover:bg-gray-300 px-2 py-1 rounded"
+              title="Recenter"
+            >Recenter</button>
+          </div>
         </div>
       )}
     </div>

@@ -64,7 +64,7 @@ function applyPre(x, y, opt) {
 }
 
 export default function AutoCalibration() {
-  const { positions, tagNames, calibration, updateCalibration } = useData();
+  const { positions, tagNames, updateCalibration } = useData();
   const [rows, setRows] = useState([
     { tagId: "", mapX: "", mapY: "" },
     { tagId: "", mapX: "", mapY: "" },

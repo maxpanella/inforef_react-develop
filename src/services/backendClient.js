@@ -69,3 +69,89 @@ export const saveAssociation = async (tagId, targetType, targetId, siteId) => {
 		body: JSON.stringify({ tagId, targetType, targetId, siteId }),
 	});
 };
+
+export const getTags = async () => {
+	const resp = await fetch(`${env.backendUrl}/api/tags`);
+	if (!resp.ok) throw new Error('Failed to fetch tags');
+	return resp.json();
+};
+
+export const createTag = async (id, battery = null) => {
+	let body = { id };
+	if (battery !== null && battery !== undefined && battery !== '') body.battery = battery;
+	const resp = await fetch(`${env.backendUrl}/api/tags`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	if (!resp.ok) {
+		let text = '';
+		try { text = await resp.text(); } catch(_) {}
+		throw new Error(`Failed to create tag (status ${resp.status}): ${text}`);
+	}
+	return resp.json();
+};
+
+// Tag assignments (time-bounded)
+export const listTagAssignments = async ({ tagId, siteId, current } = {}) => {
+	const qs = new URLSearchParams();
+	if (tagId) qs.set('tagId', tagId);
+	if (siteId) qs.set('siteId', siteId);
+	if (current) qs.set('current', '1');
+	const resp = await fetch(`${env.backendUrl}/api/tag-assignments${qs.toString() ? `?${qs.toString()}` : ''}`);
+	if (!resp.ok) throw new Error('Failed to fetch tag assignments');
+	return resp.json();
+};
+
+export const createTagAssignment = async ({ tagId, targetType, targetId, siteId, validFrom, validTo }) => {
+	const resp = await fetch(`${env.backendUrl}/api/tag-assignments`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ tagId, targetType, targetId, siteId, validFrom, validTo }),
+	});
+	if (!resp.ok) throw new Error('Failed to create tag assignment');
+	return resp.json();
+};
+
+export const closeTagAssignment = async ({ id, tagId, siteId, validTo }) => {
+	const resp = await fetch(`${env.backendUrl}/api/tag-assignments/close`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ id, tagId, siteId, validTo }),
+	});
+	if (!resp.ok) throw new Error('Failed to close tag assignment');
+	return resp.json();
+};
+
+export const deleteTag = async (id) => {
+	let resp = await fetch(`${env.backendUrl}/api/tags/${encodeURIComponent(id)}`, { method: 'DELETE' });
+	if (!resp.ok) {
+		// Fallback: some environments/proxies block DELETE; try POST fallback endpoint
+		try {
+			const postResp = await fetch(`${env.backendUrl}/api/tags/${encodeURIComponent(id)}/delete`, { method: 'POST' });
+			if (!postResp.ok) {
+				let text2 = '';
+				try { text2 = await postResp.text(); } catch(_) {}
+				throw new Error(`Failed to delete tag via fallback (status ${postResp.status}): ${text2}`);
+			}
+			return postResp.json();
+		} catch (e) {
+			let text = '';
+			try { text = await resp.text(); } catch(_) {}
+			throw new Error(`Failed to delete tag (status ${resp.status}): ${text} ${e?.message? ' | Fallback: '+e.message : ''}`);
+		}
+	}
+	return resp.json();
+};
+
+export const restoreTag = async (id) => {
+	const resp = await fetch(`${env.backendUrl}/api/tags/${encodeURIComponent(id)}/restore`, {
+		method: 'POST',
+	});
+	if (!resp.ok) {
+		let text = '';
+		try { text = await resp.text(); } catch(_) {}
+		throw new Error(`Failed to restore tag (status ${resp.status}): ${text}`);
+	}
+	return resp.json();
+};

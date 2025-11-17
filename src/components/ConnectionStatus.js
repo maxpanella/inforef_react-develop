@@ -73,7 +73,8 @@ const ConnectionStatus = () => {
   LocalsenseClient.off("close", handleClose);
       clearInterval(intId);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Funzione per tentare la riconnessione
   const handleReconnect = () => {
@@ -213,6 +214,21 @@ const ConnectionStatus = () => {
             >
               ID 32-bit
             </button>
+            <button
+              className="bg-white text-gray-800 px-2 py-1 rounded text-sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                try {
+                  const cur = diag?.runtime?.posOutType || 'XY';
+                  const order = ['XY', 'XY_GLOBAL', 'GLOBAL', 'GEO', 'XY_GEO'];
+                  const idx = order.indexOf(cur);
+                  const next = order[(idx + 1) % order.length];
+                  LocalsenseClient.setPosOutType?.(next);
+                } catch(_) {}
+              }}
+            >
+              Coord mode
+            </button>
             <div className="col-span-2 text-[11px] leading-tight bg-white/90 text-gray-800 rounded p-2">
               <div className="font-semibold">Diagnostica BlueIOT</div>
               <div>Frames: BIN {diag.frameCounters?.bin ?? 0} / TXT {diag.frameCounters?.txt ?? 0}</div>
@@ -222,7 +238,7 @@ const ConnectionStatus = () => {
               {diag.lastSwitchResult && (
                 <div>Last switch result: <span className="font-mono break-all">{String(diag.lastSwitchResult)}</span></div>
               )}
-              <div className="mt-1">Proto: {diag.runtime?.proto} | Salted: {diag.runtime?.forceUnsalted ? 'no' : 'sì'}</div>
+              <div className="mt-1">Proto: {diag.runtime?.proto} | Salted: {diag.runtime?.forceUnsalted ? 'no' : 'sì'} | PosOut: {diag.runtime?.posOutType || 'XY'}</div>
               <div>Filtri pos: {diag.runtime?.filtersEnabled ? 'ON' : 'OFF'}{typeof diag.runtime?.safeAbs !== 'undefined' ? ` (SAFE_ABS=${diag.runtime.safeAbs}m)` : ''}</div>
               {diag.frameTypeCounts && (
                 <div className="mt-1">Frame types: {Object.entries(diag.frameTypeCounts).map(([k,v]) => `${k}=${v}`).join(' ')}</div>
@@ -231,6 +247,9 @@ const ConnectionStatus = () => {
                 <div className="mt-1">
                   POS diag: jsonFrames {diag.posDiag.jsonFrames ?? 0} / binFrames {diag.posDiag.binFrames ?? 0} | accepted {diag.posDiag.accepted ?? 0} | droppedTooBig {diag.posDiag.droppedTooBig ?? 0} | droppedNaN {diag.posDiag.droppedNaN ?? 0}
                 </div>
+              )}
+              {diag.posDiag?.lastFlags && (
+                <div>Coord flags: global={diag.posDiag.lastFlags.isGlobal ? 'true' : 'false'} | geo={diag.posDiag.lastFlags.isGeo ? 'true' : 'false'}</div>
               )}
               {typeof diag.lastCloseCode !== 'undefined' && diag.lastCloseCode !== null && (
                 <div>Last close code: {String(diag.lastCloseCode)}</div>

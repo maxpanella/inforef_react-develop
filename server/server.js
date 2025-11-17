@@ -175,6 +175,32 @@ db.serialize(() => {
 		config TEXT,
 		updated DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`);
+
+	// Time-bounded tag assignments history
+	db.run(`CREATE TABLE IF NOT EXISTS tag_assignments (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		tagId TEXT NOT NULL,
+		targetType TEXT NOT NULL, -- 'employee' | 'asset'
+		targetId INTEGER NOT NULL,
+		siteId INTEGER,
+		validFrom DATETIME NOT NULL,
+		validTo DATETIME,
+		created DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`);
+	// Helpful indexes
+	db.run(`CREATE INDEX IF NOT EXISTS idx_tag_assignments_tag ON tag_assignments(tagId)`);
+	db.run(`CREATE INDEX IF NOT EXISTS idx_tag_assignments_valid ON tag_assignments(tagId, validFrom, validTo)`);
+
+	// Ensure soft-delete column on tags
+	try {
+		db.all(`PRAGMA table_info(tags)`, [], (err, rows) => {
+			if (err) return; // ignore
+			const hasDecom = Array.isArray(rows) && rows.some(c => String(c.name).toLowerCase() === 'decommissionedat');
+			if (!hasDecom) {
+				try { db.run(`ALTER TABLE tags ADD COLUMN decommissionedAt DATETIME`); } catch(_) {}
+			}
+		});
+	} catch(_) {}
 });
 
 // === Routes ===
@@ -405,6 +431,115 @@ app.get('/api/map-config/:siteId', (req, res) => {
 	});
 });
 
+// Simple Tag Registry endpoints
+app.get('/api/tags', (req, res) => {
+	db.all(`SELECT id, battery, decommissionedAt FROM tags ORDER BY id ASC`, [], (err, rows) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		res.json(rows || []);
+	});
+});
+
+app.post('/api/tags', (req, res) => {
+	const { id, battery } = req.body || {};
+	if (!id || typeof id !== 'string') {
+		return res.status(400).json({ error: 'Missing tag id' });
+	}
+	// Normalize battery only if a numeric value was explicitly provided (avoid treating null as 0)
+	let batt = null;
+	if (battery !== null && battery !== undefined && battery !== '') {
+		const num = Number(battery);
+		if (Number.isFinite(num)) batt = num;
+	}
+	console.log('[POST /api/tags] incoming', { id, batteryRaw: battery, parsedBattery: batt });
+	const sql = batt === null ? `REPLACE INTO tags (id, battery) VALUES (?, COALESCE((SELECT battery FROM tags WHERE id = ?), -1))` : `REPLACE INTO tags (id, battery) VALUES (?, ?)`;
+	const params = batt === null ? [id, id] : [id, batt];
+	db.run(sql, params, (err) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		res.json({ success: true });
+	});
+});
+
+app.delete('/api/tags/:id', (req, res) => {
+	const id = req.params.id;
+	if (!id) return res.status(400).json({ error: 'Missing tag id' });
+	console.log('[DELETE /api/tags/:id] requested', id);
+	// Hard delete only if no assignments/positions/associations exist; otherwise soft-delete
+	db.serialize(() => {
+		db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+			if (errA) return res.status(500).json({ error: 'DB error' });
+			db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+				if (errP) return res.status(500).json({ error: 'DB error' });
+				db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+					if (errS) return res.status(500).json({ error: 'DB error' });
+					const hasHistory = !!(rowA || rowP || rowS);
+					if (!hasHistory) {
+						// Hard delete - remove dependent records and the tag itself
+						db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+							if (errDel) return res.status(500).json({ error: 'DB error' });
+							return res.json({ success: true, removed: this.changes || 0, soft: false });
+						});
+					} else {
+						// Soft delete - mark decommissioned and clear current association snapshot
+						db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+							if (errU) return res.status(500).json({ error: 'DB error' });
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
+								return res.json({ success: true, removed: 0, soft: true });
+							});
+						});
+					}
+				});
+			});
+		});
+	});
+});
+
+// Fallback for environments where DELETE might be blocked: POST /api/tags/:id/delete
+app.post('/api/tags/:id/delete', (req, res) => {
+	const id = req.params.id;
+	if (!id) return res.status(400).json({ error: 'Missing tag id' });
+	console.log('[POST /api/tags/:id/delete] requested', id);
+	db.serialize(() => {
+		db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+			if (errA) return res.status(500).json({ error: 'DB error' });
+			db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+				if (errP) return res.status(500).json({ error: 'DB error' });
+				db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+					if (errS) return res.status(500).json({ error: 'DB error' });
+					const hasHistory = !!(rowA || rowP || rowS);
+					if (!hasHistory) {
+						db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
+						db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+							if (errDel) return res.status(500).json({ error: 'DB error' });
+							return res.json({ success: true, removed: this.changes || 0, soft: false });
+						});
+					} else {
+						db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+							if (errU) return res.status(500).json({ error: 'DB error' });
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
+								return res.json({ success: true, removed: 0, soft: true });
+							});
+						});
+					}
+				});
+			});
+		});
+	});
+});
+
+app.post('/api/tags/:id/restore', (req, res) => {
+	const id = req.params.id;
+	if (!id) return res.status(400).json({ error: 'Missing tag id' });
+	db.run(`UPDATE tags SET decommissionedAt = NULL WHERE id = ?`, [id], function(err) {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		res.json({ success: true, restored: this.changes || 0 });
+	});
+});
+
 app.post('/api/map-config', (req, res) => {
 	const { siteId, config } = req.body || {};
 	if (!siteId || typeof config === 'undefined') {
@@ -496,4 +631,100 @@ app.get('/api/associations/:siteId', (req, res) => {
 			res.json(rows);
 		}
 	);
+});
+
+// === Tag assignments (time-bounded) ===
+// List assignments (optionally filter by tagId/siteId). If current=1, only open/current ones
+app.get('/api/tag-assignments', (req, res) => {
+	const { tagId, siteId, current } = req.query || {};
+	const clauses = [];
+	const params = [];
+	if (tagId) { clauses.push('tagId = ?'); params.push(String(tagId)); }
+	if (siteId) { clauses.push('siteId = ?'); params.push(String(siteId)); }
+	if (current === '1' || current === 'true') {
+		clauses.push('(validTo IS NULL OR validTo > CURRENT_TIMESTAMP)');
+	}
+	const where = clauses.length ? ('WHERE ' + clauses.join(' AND ')) : '';
+	const sql = `SELECT * FROM tag_assignments ${where} ORDER BY validFrom DESC, id DESC`;
+	db.all(sql, params, (err, rows) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		res.json(rows || []);
+	});
+});
+
+// Create new assignment and automatically close previous open assignment for the same tag/site
+app.post('/api/tag-assignments', (req, res) => {
+	const { tagId, targetType, targetId, siteId, validFrom, validTo } = req.body || {};
+	if (!tagId || !targetType || !targetId) {
+		return res.status(400).json({ error: 'Missing tagId/targetType/targetId' });
+	}
+	if (targetType !== 'employee' && targetType !== 'asset') {
+		return res.status(400).json({ error: 'Invalid targetType' });
+	}
+	const startTs = validFrom ? new Date(validFrom) : new Date();
+	if (isNaN(startTs.getTime())) return res.status(400).json({ error: 'Invalid validFrom' });
+	const endTs = validTo ? new Date(validTo) : null;
+
+	db.serialize(() => {
+		// ensure tag exists
+		db.run('INSERT OR IGNORE INTO tags (id, battery) VALUES (?, COALESCE((SELECT battery FROM tags WHERE id=?), -1))', [String(tagId), String(tagId)]);
+		// close previous open assignment for this tag/site
+		db.run(
+			`UPDATE tag_assignments SET validTo = ? WHERE tagId = ? AND (siteId IS ? OR siteId = ?) AND (validTo IS NULL OR validTo > ?)`,
+			[startTs.toISOString(), String(tagId), siteId || null, siteId || null, startTs.toISOString()],
+			(errClose) => {
+				if (errClose) return res.status(500).json({ error: 'DB error' });
+				// insert new assignment
+				db.run(
+					`INSERT INTO tag_assignments (tagId, targetType, targetId, siteId, validFrom, validTo) VALUES (?, ?, ?, ?, ?, ?)`,
+					[String(tagId), targetType, Number(targetId), siteId || null, startTs.toISOString(), endTs ? endTs.toISOString() : null],
+					function (errIns) {
+						if (errIns) return res.status(500).json({ error: 'DB error' });
+						res.json({ success: true, id: this.lastID });
+					}
+				);
+			}
+		);
+	});
+});
+
+// Close assignment: by id or by (tagId, siteId) current one
+app.post('/api/tag-assignments/close', (req, res) => {
+	const { id, tagId, siteId, validTo } = req.body || {};
+	const endTs = validTo ? new Date(validTo) : new Date();
+	if (isNaN(endTs.getTime())) return res.status(400).json({ error: 'Invalid validTo' });
+	if (id) {
+		db.run(`UPDATE tag_assignments SET validTo = ? WHERE id = ?`, [endTs.toISOString(), Number(id)], (err) => {
+			if (err) return res.status(500).json({ error: 'DB error' });
+			res.json({ success: true });
+		});
+		return;
+	}
+	if (!tagId) return res.status(400).json({ error: 'Missing id or tagId' });
+	db.run(
+		`UPDATE tag_assignments SET validTo = ? WHERE tagId = ? AND (siteId IS ? OR siteId = ?) AND (validTo IS NULL OR validTo > CURRENT_TIMESTAMP)`,
+		[endTs.toISOString(), String(tagId), siteId || null, siteId || null],
+		(err) => {
+			if (err) return res.status(500).json({ error: 'DB error' });
+			res.json({ success: true });
+		}
+	);
+});
+
+// Current associations derived from assignments
+app.get('/api/current-associations/:siteId', (req, res) => {
+	const siteId = req.params.siteId;
+	const sql = `
+		SELECT ta.*, 
+			CASE WHEN ta.targetType='employee' THEN u.name ELSE ast.name END AS targetName
+		FROM tag_assignments ta
+		LEFT JOIN users u ON ta.targetType='employee' AND ta.targetId=u.id
+		LEFT JOIN assets ast ON ta.targetType='asset' AND ta.targetId=ast.id
+		WHERE (ta.siteId IS ? OR ta.siteId = ?) AND (ta.validTo IS NULL OR ta.validTo > CURRENT_TIMESTAMP)
+		ORDER BY ta.tagId ASC
+	`;
+	db.all(sql, [siteId || null, siteId || null], (err, rows) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		res.json(rows || []);
+	});
 });
