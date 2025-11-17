@@ -1,5 +1,32 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useData } from '../context/DataContext';
+
+const CRM_USERS_STORAGE_KEY = 'crm_cached_users';
+const CRM_ASSETS_STORAGE_KEY = 'crm_cached_assets';
+
+const readCachedArray = (key) => {
+	if (typeof window === 'undefined' || !window.localStorage) return [];
+	try {
+		const raw = window.localStorage.getItem(key);
+		const parsed = raw ? JSON.parse(raw) : [];
+		return Array.isArray(parsed) ? parsed : [];
+	} catch (error) {
+		console.warn(`Impossibile leggere ${key} dalla cache locale`, error);
+		return [];
+	}
+};
+
+const persistCachedArray = (key, value = []) => {
+	if (typeof window === 'undefined' || !window.localStorage) return;
+	try {
+		window.localStorage.setItem(
+			key,
+			JSON.stringify(Array.isArray(value) ? value : [])
+		);
+	} catch (error) {
+		console.warn(`Impossibile salvare ${key} in cache locale`, error);
+	}
+};
 
 const TagAssociationPage = () => {
 	const { tags, employees, assets, tagAssociations, associateTag } = useData();
@@ -7,6 +34,40 @@ const TagAssociationPage = () => {
 	const [selectedEntity, setSelectedEntity] = useState('');
 	const [entityType, setEntityType] = useState('employee');
 	const [message, setMessage] = useState('');
+	const [localEmployees, setLocalEmployees] = useState(() =>
+		Array.isArray(employees) && employees.length > 0
+			? employees
+			: readCachedArray(CRM_USERS_STORAGE_KEY)
+	);
+	const [localAssets, setLocalAssets] = useState(() =>
+		Array.isArray(assets) && assets.length > 0
+			? assets
+			: readCachedArray(CRM_ASSETS_STORAGE_KEY)
+	);
+
+	useEffect(() => {
+		if (Array.isArray(employees) && employees.length > 0) {
+			setLocalEmployees(employees);
+			persistCachedArray(CRM_USERS_STORAGE_KEY, employees);
+		} else {
+			const cachedEmployees = readCachedArray(CRM_USERS_STORAGE_KEY);
+			if (cachedEmployees.length > 0) {
+				setLocalEmployees(cachedEmployees);
+			}
+		}
+	}, [employees]);
+
+	useEffect(() => {
+		if (Array.isArray(assets) && assets.length > 0) {
+			setLocalAssets(assets);
+			persistCachedArray(CRM_ASSETS_STORAGE_KEY, assets);
+		} else {
+			const cachedAssets = readCachedArray(CRM_ASSETS_STORAGE_KEY);
+			if (cachedAssets.length > 0) {
+				setLocalAssets(cachedAssets);
+			}
+		}
+	}, [assets]);
 
 	const handleAssociate = () => {
 		if (selectedTag && selectedEntity) {
@@ -14,6 +75,9 @@ const TagAssociationPage = () => {
 			setMessage('Tag associato con successo.');
 		}
 	};
+
+	const availableEntities =
+		entityType === 'employee' ? localEmployees : localAssets;
 
 	return (
 		<div className='p-6'>
@@ -53,7 +117,7 @@ const TagAssociationPage = () => {
 						onChange={(e) => setSelectedEntity(e.target.value)}
 					>
 						<option value=''>-- Seleziona --</option>
-						{(entityType === 'employee' ? employees : assets).map((entity) => (
+						{availableEntities.map((entity) => (
 							<option key={entity.id} value={entity.id}>
 								{entity.name}
 							</option>
@@ -75,11 +139,12 @@ const TagAssociationPage = () => {
 				<h2 className='text-lg font-semibold mb-2'>Tag Associati</h2>
 				<div className='bg-white p-4 rounded shadow'>
 					{tagAssociations.map((a) => {
-						const entityList = a.targetType === 'employee' ? employees : assets;
+						const entityList =
+							a.targetType === 'employee' ? localEmployees : localAssets;
 						const entity = entityList.find((e) => e.id === a.targetId);
 						return (
 							<div key={a.tagId} className='border-b py-2'>
-								<strong>{a.tagId}</strong> → {entity?.name || 'N/A'} (
+								<strong>{a.tagId}</strong> — {entity?.name || 'N/A'} (
 								{a.targetType})
 							</div>
 						);
