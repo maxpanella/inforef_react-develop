@@ -11,22 +11,66 @@ import {
 	saveUsers,
 	saveAssets,
 	saveAssociation,
+	fetchStoredUsers,
+	fetchStoredAssets,
 } from '../services/backendClient';
 import { useData } from '../context/DataContext';
 
+const COMPANY_INFO_STORAGE_KEY = 'crm_company_info';
+const CRM_USERS_STORAGE_KEY = 'crm_cached_users';
+const CRM_ASSETS_STORAGE_KEY = 'crm_cached_assets';
+
+const readCachedJson = (key, fallback = null) => {
+	if (typeof window === 'undefined' || !window.localStorage) return fallback;
+	try {
+		const raw = window.localStorage.getItem(key);
+		return raw ? JSON.parse(raw) : fallback;
+	} catch (error) {
+		console.warn(`Impossibile leggere ${key} dalla cache locale`, error);
+		return fallback;
+	}
+};
+
+const readCachedArray = (key) => {
+	const value = readCachedJson(key, []);
+	return Array.isArray(value) ? value : [];
+};
+
 const ConfigurationPage = () => {
-	const [crmUsers, setCrmUsers] = useState([]);
-	const [crmAssets, setCrmAssets] = useState([]);
+	const [crmUsers, setCrmUsers] = useState(() =>
+		readCachedArray(CRM_USERS_STORAGE_KEY)
+	);
+	const [crmAssets, setCrmAssets] = useState(() =>
+		readCachedArray(CRM_ASSETS_STORAGE_KEY)
+	);
 	const [loading, setLoading] = useState(false);
 	const [message, setMessage] = useState('');
 	const [messageType, setMessageType] = useState(''); // 'success' or 'error'
-	const [companyInfo, setCompanyInfo] = useState(null);
+	const [companyInfo, setCompanyInfo] = useState(() =>
+		readCachedJson(COMPANY_INFO_STORAGE_KEY, null)
+	);
 	const [selectedEmployee, setSelectedEmployee] = useState(null);
 	const [employeeDetails, setEmployeeDetails] = useState(null);
 	const [jobAssignments, setJobAssignments] = useState([]);
 
 	const { tags, employees, assets, associateTag, currentSite, refreshData } =
 		useData();
+
+	const cacheImportedData = (usersList = [], assetsList = []) => {
+		if (typeof window === 'undefined' || !window.localStorage) return;
+		try {
+			localStorage.setItem(
+				CRM_USERS_STORAGE_KEY,
+				JSON.stringify(usersList || [])
+			);
+			localStorage.setItem(
+				CRM_ASSETS_STORAGE_KEY,
+				JSON.stringify(assetsList || [])
+			);
+		} catch (error) {
+			console.warn('Impossibile salvare i dati importati in cache locale', error);
+		}
+	};
 
 	const importData = async () => {
 		setLoading(true);
@@ -38,6 +82,19 @@ const ConfigurationPage = () => {
 			setMessage('Recupero informazioni azienda...');
 			const company = await fetchCompanyInfo();
 			setCompanyInfo(company);
+			if (typeof window !== 'undefined' && window.localStorage) {
+				try {
+					localStorage.setItem(
+						COMPANY_INFO_STORAGE_KEY,
+						JSON.stringify(company)
+					);
+				} catch (storageError) {
+					console.warn(
+						'Impossibile salvare le informazioni aziendali in cache locale',
+						storageError
+					);
+				}
+			}
 			console.log('Company info fetched:', company);
 
 			// Then fetch users
@@ -60,6 +117,7 @@ const ConfigurationPage = () => {
 
 			setCrmUsers(users);
 			setCrmAssets(assets);
+			cacheImportedData(users, assets);
 
 			// Refresh data in context
 			if (refreshData) {
@@ -115,12 +173,51 @@ const ConfigurationPage = () => {
 		}
 	};
 
-	// Auto-import on component mount if no data exists
-	useEffect(() => {
-		if (currentSite && crmUsers.length === 0 && crmAssets.length === 0) {
-			importData();
+	const loadExistingData = async () => {
+		try {
+			const [storedUsers, storedAssets] = await Promise.all([
+				fetchStoredUsers(),
+				fetchStoredAssets(),
+			]);
+
+			const usersList = Array.isArray(storedUsers) ? storedUsers : [];
+			const assetsList = Array.isArray(storedAssets) ? storedAssets : [];
+
+			setCrmUsers(usersList);
+			setCrmAssets(assetsList);
+			cacheImportedData(usersList, assetsList);
+
+			return usersList.length > 0 || assetsList.length > 0;
+		} catch (error) {
+			console.error(
+				'Errore durante il recupero dei dati dal backend locale:',
+				error
+			);
+			return false;
 		}
-	}, [currentSite]);
+	};
+
+	// Auto-import on component mount only if backend has no data yet
+	useEffect(() => {
+		const initializeData = async () => {
+			if (!currentSite) return;
+
+			const hasCachedData =
+				(Array.isArray(crmUsers) && crmUsers.length > 0) ||
+				(Array.isArray(crmAssets) && crmAssets.length > 0);
+
+			if (hasCachedData) {
+				return;
+			}
+
+			const hasExistingData = await loadExistingData();
+			if (!hasExistingData) {
+				await importData();
+			}
+		};
+
+		initializeData();
+	}, [currentSite, crmUsers, crmAssets]);
 
 	return (
 		<div className='p-6'>

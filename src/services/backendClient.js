@@ -69,3 +69,21 @@ export const saveAssociation = async (tagId, targetType, targetId, siteId) => {
 		body: JSON.stringify({ tagId, targetType, targetId, siteId }),
 	});
 };
+
+export const fetchStoredUsers = async () => {
+	const res = await fetch(`${env.backendUrl}/api/users`);
+	if (!res.ok) {
+		throw new Error("Errore caricamento dipendenti dal backend");
+	}
+	const data = await res.json();
+	return Array.isArray(data) ? data : [];
+};
+
+export const fetchStoredAssets = async () => {
+	const res = await fetch(`${env.backendUrl}/api/assets`);
+	if (!res.ok) {
+		throw new Error("Errore caricamento macchinari dal backend");
+	}
+	const data = await res.json();
+	return Array.isArray(data) ? data : [];
+};
