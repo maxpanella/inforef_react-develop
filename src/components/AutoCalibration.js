@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import { useData } from "../context/DataContext";
+import { canonicalizeId } from "../services/tagCanonicalizer";
 
 // Compute similarity transform (scale s, rotation R, translation t) mapping P -> Q
 // Returns { scale, rotDeg, tx, ty, rmse }
@@ -64,13 +65,14 @@ function applyPre(x, y, opt) {
 }
 
 export default function AutoCalibration() {
-  const { positions, tagNames, updateCalibration } = useData();
+  const { positions, tagNames, updateCalibration, updateTagOverride } = useData();
   const [rows, setRows] = useState([
     { tagId: "", mapX: "", mapY: "" },
     { tagId: "", mapX: "", mapY: "" },
     { tagId: "", mapX: "", mapY: "" },
   ]);
   const [result, setResult] = useState(null);
+  const [applyLocalResidCorr, setApplyLocalResidCorr] = useState(true);
   const havePairs = useMemo(() => rows.filter(r => r.tagId && r.mapX !== "" && r.mapY !== "").length, [rows]);
 
   const normalizeInputId = (raw) => {
@@ -99,6 +101,7 @@ export default function AutoCalibration() {
     // Collect pairs present in positions
     const P = []; // engine positions (raw meters)
     const Q = []; // map target coords (DXF units)
+    const IDS = []; // normalized ids used
     rows.forEach(r => {
       const id = normalizeInputId(r.tagId);
       if (!id) return;
@@ -108,6 +111,7 @@ export default function AutoCalibration() {
       if (!isFinite(mx) || !isFinite(my)) return;
       P.push({ x: Number(pos.x) || 0, y: Number(pos.y) || 0 });
       Q.push({ x: mx, y: my });
+      IDS.push(id);
     });
     if (P.length < 2) { setResult({ error: "Servono almeno 2 tag con coordinate mappa" }); return; }
 
@@ -129,12 +133,49 @@ export default function AutoCalibration() {
       invertY: bestOpt === 1 || bestOpt === 3,
       swapXY: bestOpt === 2 || bestOpt === 3,
     };
-    setResult({ ...best, chosen: bestOpt, params: next });
+    // Per-residuo: calcola residui per ogni punto inserito
+    const resid = [];
+    try {
+      const rad = (Number(next.rotationDeg) || 0) * Math.PI / 180;
+      const c = Math.cos(rad), s = Math.sin(rad);
+      const sc = Number(next.scale) || 1;
+      for (let i = 0; i < P.length; i++) {
+        let px = P[i].x, py = P[i].y;
+        // pre-opt reverse check: our bestOpt expresses how we preprocessed P before fitting; emulate same here
+        // We applied applyPre before fitting; so to predict Q_hat we must apply the same pre to P
+        const ap = (opt) => {
+          switch (opt) {
+            case 1: return { x: px, y: -py };
+            case 2: return { x: py, y: px };
+            case 3: return { x: py, y: -px };
+            default: return { x: px, y: py };
+          }
+        };
+        const p2 = ap(bestOpt);
+        const xh = sc * (c * p2.x - s * p2.y) + Number(next.offsetX || 0);
+        const yh = sc * (s * p2.x + c * p2.y) + Number(next.offsetY || 0);
+        const dx = Number(Q[i].x) - xh;
+        const dy = Number(Q[i].y) - yh;
+        resid.push({ id: IDS[i], dx, dy, err: Math.hypot(dx, dy) });
+      }
+    } catch(_) {}
+    setResult({ ...best, chosen: bestOpt, params: next, residuals: resid });
   };
 
-  const apply = () => {
+  const apply = (withLocal = false) => {
     if (!result || !result.params) return;
     updateCalibration(result.params);
+    if (withLocal && Array.isArray(result.residuals)) {
+      // Applica correzione locale per ciascun tag usato, se residuo significativo
+      const EPS = 0.01; // soglia minima in unità mappa
+      result.residuals.forEach(r => {
+        try {
+          const canon = canonicalizeId(r.id) || String(r.id);
+          const dx = Number(r.dx) || 0, dy = Number(r.dy) || 0;
+          if (Math.hypot(dx, dy) >= EPS) updateTagOverride(canon, dx, dy);
+        } catch(_) {}
+      });
+    }
   };
 
   const updateRow = (i, field, value) => {
@@ -175,12 +216,22 @@ export default function AutoCalibration() {
         <button className="px-2 py-1 bg-indigo-600 text-white text-sm rounded disabled:opacity-50" disabled={havePairs < 2} onClick={compute}>
           Calcola
         </button>
-        <button className="px-2 py-1 bg-emerald-600 text-white text-sm rounded disabled:opacity-50" disabled={!result || !result.params} onClick={apply}>
-          Applica
+        <button className="px-2 py-1 bg-emerald-600 text-white text-sm rounded disabled:opacity-50" disabled={!result || !result.params} onClick={() => apply(false)}>
+          Applica (solo calibrazione)
         </button>
+        <button className="px-2 py-1 bg-emerald-700 text-white text-sm rounded disabled:opacity-50" disabled={!result || !result.params} onClick={() => apply(true)} title="Applica calibrazione globale e correggi i residui dei tag usati con override locali">
+          Applica + correggi residui
+        </button>
+        <label className="ml-2 text-xs flex items-center gap-1"><input type="checkbox" checked={applyLocalResidCorr} onChange={e=> setApplyLocalResidCorr(e.target.checked)} /> auto-correggi residui</label>
         {result && result.rmse !== undefined && (
           <div className="text-xs text-gray-700">
             RMSE: {result.rmse.toFixed(2)} | scale: {result.scale.toFixed(4)} | rot: {result.rotDeg.toFixed(2)}° | off: ({result.tx.toFixed(2)}, {result.ty.toFixed(2)}) | opt: {result.chosen}
+            {Array.isArray(result.residuals) && result.residuals.length>0 && (
+              <>
+                <br/>
+                Residui: {result.residuals.map((r,i)=> `${normalizeInputId(r.id)}:${Math.hypot(r.dx,r.dy).toFixed(2)}`).join(' | ')}
+              </>
+            )}
           </div>
         )}
         {result && result.error && (

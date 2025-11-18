@@ -37,6 +37,8 @@ const DashboardPage = () => {
     createTag,
     removeTag,
     restoreTag,
+    updateTagOverride,
+    clearTagOverride,
   } = useData();
 
   // Set dei tag presenti in anagrafica (DB), canonicalizzati
@@ -141,6 +143,21 @@ const DashboardPage = () => {
     updateCalibration({ offsetX: offsetX_new, offsetY: offsetY_new });
   };
 
+  // Centra SOLO il tag selezionato applicando una correzione locale (non sposta gli altri)
+  const centerSelectedTagLocal = () => {
+    if (!selectedTag) return;
+    const info = enhancedPositions[selectedTag];
+    if (!info) return;
+    const targetX = mapBounds ? ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2 : 500;
+    const targetY = mapBounds ? ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2 : 400;
+    const dx = targetX - Number(info.x || 0);
+    const dy = targetY - Number(info.y || 0);
+    const key = String(selectedTag);
+    const cur = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
+    const prev = cur[key] || { dx: 0, dy: 0 };
+    updateTagOverride(key, (Number(prev.dx)||0) + dx, (Number(prev.dy)||0) + dy);
+  };
+
   const placeSelectedTag = () => {
     if (!selectedTag) return;
     const info = enhancedPositions[selectedTag];
@@ -158,6 +175,32 @@ const DashboardPage = () => {
     const offsetX_new = (Number(calibration.offsetX) || 0) + (destX - info.x);
     const offsetY_new = (Number(calibration.offsetY) || 0) + (destY - info.y);
     updateCalibration({ offsetX: offsetX_new, offsetY: offsetY_new });
+  };
+
+  // Posiziona SOLO il tag selezionato (override locale)
+  const placeSelectedTagLocal = () => {
+    if (!selectedTag) return;
+    const info = enhancedPositions[selectedTag];
+    if (!info) return;
+    const defX = mapBounds ? ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2 : 500;
+    const defY = mapBounds ? ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2 : 400;
+    const destStr = window.prompt('Inserisci coordinate destinazione (solo questo tag) "X,Y"', `${defX},${defY}`);
+    if (!destStr) return;
+    const parts = destStr.split(/[,; ]+/).map(v => Number(v));
+    if (parts.length < 2 || parts.some(v => Number.isNaN(v))) { alert('Formato non valido'); return; }
+    const [destX, destY] = parts;
+    const dx = destX - Number(info.x || 0);
+    const dy = destY - Number(info.y || 0);
+    const key = String(selectedTag);
+    const cur = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
+    const prev = cur[key] || { dx: 0, dy: 0 };
+    updateTagOverride(key, (Number(prev.dx)||0) + dx, (Number(prev.dy)||0) + dy);
+  };
+
+  // Rimuove correzione locale del tag selezionato
+  const clearSelectedTagLocal = () => {
+    if (!selectedTag) return;
+    clearTagOverride(String(selectedTag));
   };
   
   const [isLoading, setIsLoading] = useState(true);
@@ -416,7 +459,7 @@ EOF`;
     let positionsWithInfo = [];
 
     // Trasformazione coordinate in base alla calibrazione
-    const applyTransform = (x, y) => {
+    const applyTransform = (x, y, idKey) => {
       if (useRawPositions) return { x: Number(x) || 0, y: Number(y) || 0 };
       let xx = Number(x) || 0;
       let yy = Number(y) || 0;
@@ -434,6 +477,16 @@ EOF`;
       const scale = Number(calibration.scale) || 1;
       xx = xx * scale + (Number(calibration.offsetX) || 0);
       yy = yy * scale + (Number(calibration.offsetY) || 0);
+      // Per-tag override (dx,dy) applicato DOPO la calibrazione globale
+      try {
+        const ov = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
+        const key = String(idKey || '');
+        if (key && ov[key]) {
+          const dx = Number(ov[key].dx) || 0;
+          const dy = Number(ov[key].dy) || 0;
+          xx += dx; yy += dy;
+        }
+      } catch(_) {}
       return { x: xx, y: yy };
     };
     // Filtra per recenti
@@ -444,7 +497,7 @@ EOF`;
       const age = now - pos.ts;
       if (age > ACTIVE_WINDOW_MS) return;
       const canon = canonicalizeId(tagId);
-      const t = applyTransform(pos.x, pos.y);
+      const t = applyTransform(pos.x, pos.y, canon);
       const entry = {
         tagId,
         canonId: canon,
@@ -1042,6 +1095,7 @@ EOF`;
                 {enhancedPositions[selectedTag] && (
                   <>
                     <div><span className="font-semibold">Pos:</span> {enhancedPositions[selectedTag].x.toFixed(2)}, {enhancedPositions[selectedTag].y.toFixed(2)}</div>
+                    {(() => { try { const ov = (calibration && calibration.tagOverrides) ? calibration.tagOverrides[String(selectedTag)] : null; return ov ? (<div><span className="font-semibold">Correzione tag:</span> dx {Number(ov.dx||0).toFixed(2)}, dy {Number(ov.dy||0).toFixed(2)}</div>) : null; } catch(_) { return null; } })()}
                     {typeof enhancedPositions[selectedTag].cap !== 'undefined' && (
                       <div><span className="font-semibold">Batteria:</span> {enhancedPositions[selectedTag].cap}%</div>
                     )}
@@ -1056,8 +1110,12 @@ EOF`;
                 )}
               </div>
               <div className="mt-3 flex gap-2 flex-wrap text-xs">
-                <button onClick={centerSelectedTag} className="px-2 py-1 bg-indigo-600 text-white rounded" title="Centra il tag e aggiorna Offset">Centra tag</button>
-                <button onClick={placeSelectedTag} className="px-2 py-1 bg-purple-600 text-white rounded" title="Imposta destinazione e aggiorna Offset">Posiziona manuale</button>
+                <button onClick={centerSelectedTag} className="px-2 py-1 bg-indigo-600 text-white rounded" title="Centra (offset globale - muove tutti)">Centra (globale)</button>
+                <button onClick={placeSelectedTag} className="px-2 py-1 bg-purple-600 text-white rounded" title="Posiziona (offset globale - muove tutti)">Posiziona (globale)</button>
+                <span className="inline-block w-px h-5 bg-gray-300 mx-1 align-middle" />
+                <button onClick={centerSelectedTagLocal} className="px-2 py-1 bg-emerald-700 text-white rounded" title="Centra solo questo tag (override locale)">Centra solo tag</button>
+                <button onClick={placeSelectedTagLocal} className="px-2 py-1 bg-emerald-600 text-white rounded" title="Posiziona solo questo tag (override locale)">Posiziona solo tag</button>
+                <button onClick={clearSelectedTagLocal} className="px-2 py-1 bg-rose-600 text-white rounded" title="Rimuove la correzione locale di questo tag">Pulisci correzione tag</button>
                 {!backendTagSet.has(canonicalizeId(selectedTag)) && (
                   <button onClick={() => handleAddSpecificTag(selectedTag)} className="px-2 py-1 bg-emerald-700 text-white rounded" title="Aggiungi questo TAG all'anagrafica">Aggiungi TAG</button>
                 )}

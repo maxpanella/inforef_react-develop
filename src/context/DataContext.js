@@ -62,8 +62,12 @@ export const DataProvider = ({ children }) => {
   }, []);
 
   // Calibrazione mappa per sito corrente (scala, offset, flip/rotazione)
-  const defaultCalib = { scale: 1, offsetX: 0, offsetY: 0, invertY: false, swapXY: false, rotationDeg: 0, normalizationScale: 1 };
+  // Include anche correzioni per-tag (override locali) applicate DOPO la calibrazione globale
+  // Formato: tagOverrides: { [tagKey]: { dx, dy } }
+  const defaultCalib = { scale: 1, offsetX: 0, offsetY: 0, invertY: false, swapXY: false, rotationDeg: 0, normalizationScale: 1, tagOverrides: {} };
   const [calibration, setCalibration] = useState(defaultCalib);
+  const lastSavedCalibRef = useRef(JSON.stringify(defaultCalib));
+  const [calibrationDirty, setCalibrationDirty] = useState(false);
   const loadCalibration = async () => {
     const siteId = currentSite?.id || 'default';
     const key = `blueiot_map_calib_${siteId}`;
@@ -73,7 +77,10 @@ export const DataProvider = ({ children }) => {
       if (resp.ok) {
         const j = await resp.json();
         if (j && j.config && typeof j.config === 'object') {
-          setCalibration({ ...defaultCalib, ...j.config });
+          const loaded = { ...defaultCalib, ...j.config };
+          setCalibration(loaded);
+          lastSavedCalibRef.current = JSON.stringify(loaded);
+          setCalibrationDirty(false);
           try { localStorage.setItem(key, JSON.stringify(j.config)); } catch(_) {}
           return true;
         }
@@ -82,10 +89,15 @@ export const DataProvider = ({ children }) => {
     // Fallback local
     try {
       const saved = JSON.parse(localStorage.getItem(key) || 'null');
-      setCalibration(saved && typeof saved === 'object' ? { ...defaultCalib, ...saved } : defaultCalib);
+      const loaded = saved && typeof saved === 'object' ? { ...defaultCalib, ...saved } : defaultCalib;
+      setCalibration(loaded);
+      lastSavedCalibRef.current = JSON.stringify(loaded);
+      setCalibrationDirty(false);
       return true;
     } catch {
       setCalibration(defaultCalib);
+      lastSavedCalibRef.current = JSON.stringify(defaultCalib);
+      setCalibrationDirty(false);
       return false;
     }
   };
@@ -94,6 +106,10 @@ export const DataProvider = ({ children }) => {
     // Mantieni i valori esistenti e sovrascrivi solo i campi passati
     const merged = { ...defaultCalib, ...calibration, ...next };
     setCalibration(merged);
+    try {
+      const currentJson = JSON.stringify(merged);
+      setCalibrationDirty(currentJson !== lastSavedCalibRef.current);
+    } catch(_) {}
     const siteId = currentSite?.id || 'default';
     const key = `blueiot_map_calib_${siteId}`;
     try { localStorage.setItem(key, JSON.stringify(merged)); } catch {}
@@ -106,6 +122,26 @@ export const DataProvider = ({ children }) => {
       });
     } catch(_) {}
   };
+  // Imposta/aggiorna una correzione locale per un tag specifico (dx,dy in unità mappa)
+  const updateTagOverride = (tagKey, dx = 0, dy = 0) => {
+    try {
+      const key = String(tagKey);
+      const cur = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
+      const nextMap = { ...cur, [key]: { dx: Number(dx) || 0, dy: Number(dy) || 0 } };
+      updateCalibration({ tagOverrides: nextMap });
+    } catch (_) {}
+  };
+  // Rimuove la correzione locale per un tag
+  const clearTagOverride = (tagKey) => {
+    try {
+      const key = String(tagKey);
+      const cur = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
+      if (!cur[key]) return;
+      const nextMap = { ...cur };
+      delete nextMap[key];
+      updateCalibration({ tagOverrides: nextMap });
+    } catch (_) {}
+  };
   const saveCalibration = async () => {
     const siteId = currentSite?.id || 'default';
     const key = `blueiot_map_calib_${siteId}`;
@@ -116,6 +152,12 @@ export const DataProvider = ({ children }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ siteId, config: calibration }),
       });
+      if (resp.ok) {
+        try {
+          lastSavedCalibRef.current = JSON.stringify(calibration);
+          setCalibrationDirty(false);
+        } catch(_) {}
+      }
       return resp.ok;
     } catch {
       return false;
@@ -123,6 +165,8 @@ export const DataProvider = ({ children }) => {
   };
   const resetCalibration = async () => {
     setCalibration(defaultCalib);
+    lastSavedCalibRef.current = JSON.stringify(defaultCalib);
+    setCalibrationDirty(false);
     const siteId = currentSite?.id || 'default';
     const key = `blueiot_map_calib_${siteId}`;
     try { localStorage.setItem(key, JSON.stringify(defaultCalib)); } catch {}
@@ -249,6 +293,9 @@ export const DataProvider = ({ children }) => {
   tagNames,
       calibration,
       updateCalibration,
+        updateTagOverride,
+        clearTagOverride,
+      calibrationDirty,
   saveCalibration,
   loadCalibration,
   resetCalibration,
@@ -264,7 +311,7 @@ export const DataProvider = ({ children }) => {
       removeTag,
       restoreTag,
     }),
-    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, saveCalibration, loadCalibration, resetCalibration, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
+    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, updateTagOverride, clearTagOverride, calibrationDirty, saveCalibration, loadCalibration, resetCalibration, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
   );
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
