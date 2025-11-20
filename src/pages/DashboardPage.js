@@ -39,6 +39,10 @@ const DashboardPage = () => {
     restoreTag,
     updateTagOverride,
     clearTagOverride,
+    calibrationDirty,
+    getDiagnostics,
+    clearDiagnostics,
+    setDiagnosticsPaused,
   } = useData();
 
   // Set dei tag presenti in anagrafica (DB), canonicalizzati
@@ -70,9 +74,15 @@ const DashboardPage = () => {
   const [selectedTag, setSelectedTag] = useState(null);
   const [mapBounds, setMapBounds] = useState(null); // {min:{x,y}, max:{x,y}} unità DXF raw
   const [toast, setToast] = useState(null); // piccoli messaggi di conferma
+  // Diagnostics UI state
+  const [diagTagFilter, setDiagTagFilter] = useState("");
+  const [diagLimit, setDiagLimit] = useState(200);
+  const [diagPaused, setDiagPaused] = useState(false);
   // Suggestion UI state for auto-centering offsets
   const [suggestionVisible, setSuggestionVisible] = useState(false);
   const [suggestedOffsets, setSuggestedOffsets] = useState(null);
+  const [autoInitDone, setAutoInitDone] = useState(false);
+  const lastBannerRef = React.useRef({ shownAt: 0, hiddenAt: 0, forceHoldUntil: 0 });
   // Tool di calibrazione scala tramite spostamento
   const [calibTagId, setCalibTagId] = useState(""); // cattura A/B dallo stesso tag
   const [ptA, setPtA] = useState(null); // {x,y,ts}
@@ -209,9 +219,12 @@ const DashboardPage = () => {
   const [isolateSelected, setIsolateSelected] = useState(false);
   const [simpleMode, setSimpleMode] = useState(true);
   const [followSelected, setFollowSelected] = useState(false); // disattiva pan automatico sul click
+  const [showRefPoints, setShowRefPoints] = useState(true);
 
   // Rileva se i tag risultano fuori dalla planimetria e fornisce un'azione rapida di riallineamento offset
   const [offMapInfo, setOffMapInfo] = useState({ total: 0, inMap: 0, nearMap: 0 });
+  const [autoAlignedAt, setAutoAlignedAt] = useState(0);
+  const [calibChangedAt, setCalibChangedAt] = useState(0);
   useEffect(() => {
     try {
       const total = Object.keys(enhancedPositions).length;
@@ -229,22 +242,126 @@ const DashboardPage = () => {
     } catch(_) {}
   }, [enhancedPositions, mapBounds]);
 
+  // Registra timestamp quando cambia la calibrazione (per auto-offset assistito)
+  useEffect(() => {
+    try { setCalibChangedAt(Date.now()); } catch(_) {}
+  }, [calibration.scale, calibration.offsetX, calibration.offsetY, calibration.rotationDeg, calibration.invertY, calibration.swapXY, calibration.affineEnabled, calibration.affine, calibration.pivotX, calibration.pivotY]);
+
+  // Dopo una calibrazione recente, se tutti i tag sono fuori mappa, autolinea offset una sola volta
+  useEffect(() => {
+    const now = Date.now();
+    const recentMs = 2500;
+    if (calibChangedAt && (now - calibChangedAt) < recentMs && offMapInfo.total > 0 && offMapInfo.inMap === 0) {
+      if (!autoAlignedAt || (now - autoAlignedAt) > recentMs) {
+        try { autoAlignOffsets(); setAutoAlignedAt(now); } catch(_) {}
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offMapInfo, calibChangedAt]);
+
   const autoAlignOffsets = () => {
     if (!mapBounds) { alert('Mappa non pronta'); return; }
     const ids = Object.keys(enhancedPositions);
     if (ids.length === 0) { alert('Nessun tag da allineare'); return; }
-    const cx = ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2;
-    const cy = ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2;
-    let sumX = 0, sumY = 0, n = 0;
-    ids.forEach(id => { const p = enhancedPositions[id]; if (!p) return; const x = Number(p.x); const y = Number(p.y); if (isFinite(x) && isFinite(y)) { sumX += x; sumY += y; n++; } });
-    if (n === 0) { alert('Coordinate non valide per i tag'); return; }
-    const avgX = sumX / n;
-    const avgY = sumY / n;
-    const dx = cx - avgX;
-    const dy = cy - avgY;
-    updateCalibration({ offsetX: (Number(calibration.offsetX)||0) + dx, offsetY: (Number(calibration.offsetY)||0) + dy });
-    try { setToast({ type: 'success', msg: 'Offset aggiornati per centrare i tag sulla mappa' }); } catch(_) {}
+    const b = mapBounds;
+    const xmin = Number(b.min?.x) || 0;
+    const xmax = Number(b.max?.x) || 0;
+    const ymin = Number(b.min?.y) || 0;
+    const ymax = Number(b.max?.y) || 0;
+
+    // Costruisci gli intervalli di offset ammissibili per portare ciascun punto dentro i confini
+    const xIntervals = [];
+    const yIntervals = [];
+    let validCount = 0;
+    ids.forEach((id) => {
+      const p = enhancedPositions[id];
+      if (!p) return;
+      const x = Number(p.x); const y = Number(p.y);
+      if (!isFinite(x) || !isFinite(y)) return;
+      validCount++;
+      xIntervals.push([xmin - x, xmax - x]);
+      yIntervals.push([ymin - y, ymax - y]);
+    });
+    if (validCount === 0) { alert('Coordinate non valide per i tag'); return; }
+
+    const sweepMaxOverlap = (intervals) => {
+      // Restituisce {bestL, bestR, overlap} dell'intervallo con massima copertura
+      const events = [];
+      intervals.forEach(([l, r]) => {
+        const L = Math.min(l, r), R = Math.max(l, r);
+        events.push([L, +1]);
+        events.push([R, -1]);
+      });
+      events.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      let cur = 0, best = 0, bestL = null, bestR = null;
+      for (let i = 0; i < events.length; i++) {
+        const [pos, type] = events[i];
+        cur += type;
+        // In segmento tra questo pos e il prossimo pos
+        const nextPos = (i + 1 < events.length) ? events[i + 1][0] : pos;
+        if (nextPos > pos) {
+          if (cur > best) { best = cur; bestL = pos; bestR = nextPos; }
+        }
+      }
+      return { bestL, bestR, overlap: best };
+    };
+
+    const bestX = sweepMaxOverlap(xIntervals);
+    const bestY = sweepMaxOverlap(yIntervals);
+
+    // Se riusciamo a coprire almeno metà dei tag, usiamo l'intervallo migliore; altrimenti fallback al baricentro
+    const threshold = Math.max(1, Math.ceil(validCount * 0.5));
+    let dx, dy;
+    if (bestX.overlap >= threshold && bestX.bestL != null) {
+      dx = (bestX.bestL + bestX.bestR) / 2;
+    }
+    if (bestY.overlap >= threshold && bestY.bestL != null) {
+      dy = (bestY.bestL + bestY.bestR) / 2;
+    }
+    if (dx === undefined || dy === undefined) {
+      // Fallback: centra il baricentro dei tag
+      const cx = (xmin + xmax) / 2;
+      const cy = (ymin + ymax) / 2;
+      let sumX = 0, sumY = 0; let n = 0;
+      ids.forEach(id => { const p = enhancedPositions[id]; if (!p) return; const x = Number(p.x); const y = Number(p.y); if (isFinite(x) && isFinite(y)) { sumX += x; sumY += y; n++; } });
+      const avgX = sumX / Math.max(1, n);
+      const avgY = sumY / Math.max(1, n);
+      if (dx === undefined) dx = cx - avgX;
+      if (dy === undefined) dy = cy - avgY;
+    }
+
+    // Clamp spostamento per evitare salti esagerati (<= 3 volte dimensione mappa per asse)
+    const maxDx = Math.abs((xmax - xmin) * 3);
+    const maxDy = Math.abs((ymax - ymin) * 3);
+    const safeDx = Math.max(-maxDx, Math.min(maxDx, dx));
+    const safeDy = Math.max(-maxDy, Math.min(maxDy, dy));
+
+    updateCalibration({
+      offsetX: (Number(calibration.offsetX)||0) + safeDx,
+      offsetY: (Number(calibration.offsetY)||0) + safeDy,
+    });
+    try {
+      const covX = bestX.overlap || 0; const covY = bestY.overlap || 0;
+      const covered = Math.min(validCount, Math.max(covX, covY));
+      setToast({ type: 'success', msg: `Offset aggiornati: riallineati ${covered}/${validCount} tag ai confini` });
+    } catch(_) {}
   };
+
+  // Fallback clamp activation if majority outside (>60%)
+  const [forceClamp, setForceClamp] = useState(false);
+  useEffect(() => {
+    try {
+      if (!mapBounds) { setForceClamp(false); return; }
+      const total = offMapInfo.total || 0;
+      if (total > 3) {
+        const outside = total - offMapInfo.inMap;
+        const frac = outside / Math.max(1,total);
+        setForceClamp(frac > 0.6);
+      } else {
+        setForceClamp(false);
+      }
+    } catch(_) {}
+  }, [offMapInfo, mapBounds]);
 
   const handleUseRawChange = (checked) => {
     // If enabling RAW and all tags are out of bounds, offer to auto-align
@@ -263,6 +380,13 @@ const DashboardPage = () => {
       selectSite(sites[0].id);
     }
   }, [currentSite, sites, selectSite]);
+
+  // Avviso toast quando calibrazione diventa "dirty"
+  useEffect(() => {
+    if (calibrationDirty) {
+      try { setToast({ type: 'info', msg: 'Calibrazione modificata: premere Salva per fissarla' }); } catch(_) {}
+    }
+  }, [calibrationDirty]);
 
   // Carica mappa da localStorage o esempio
   useEffect(() => {
@@ -457,6 +581,8 @@ EOF`;
     const ACTIVE_WINDOW_MS = 20000; // mostra tag fino a 20s per evitare flicker
     const MAX_TAGS = 50; // limite di sicurezza per UI
     let positionsWithInfo = [];
+    // Stabilizza presenza tag anche se timestamp mancante o salta un update
+    const lastSeenRef = window.__LAST_SEEN_TAGS || (window.__LAST_SEEN_TAGS = {});
 
     // Trasformazione coordinate in base alla calibrazione
     const applyTransform = (x, y, idKey) => {
@@ -467,16 +593,30 @@ EOF`;
         const t = xx; xx = yy; yy = t;
       }
       if (calibration.invertY) yy = -yy;
-      const rad = (Number(calibration.rotationDeg) || 0) * Math.PI / 180;
-      if (rad) {
-        const cos = Math.cos(rad), sin = Math.sin(rad);
-        const oldX = xx, oldY = yy;
-        xx = oldX * cos - oldY * sin;
-        yy = oldX * sin + oldY * cos;
+      // Applica affine se abilitata, altrimenti similarità (rot+scala+trasl)
+      if (calibration.affineEnabled && calibration.affine && isFinite(calibration.affine.a)) {
+        const A = calibration.affine;
+        const x2 = (Number(A.a)||0) * xx + (Number(A.b)||0) * yy + (Number(A.tx)||0);
+        const y2 = (Number(A.c)||0) * xx + (Number(A.d)||0) * yy + (Number(A.ty)||0);
+        xx = x2; yy = y2;
+      } else {
+        const rad = (Number(calibration.rotationDeg) || 0) * Math.PI / 180;
+        const pivX = Number(calibration.pivotX) || 0;
+        const pivY = Number(calibration.pivotY) || 0;
+        let rx = xx - pivX;
+        let ry = yy - pivY;
+        if (rad) {
+          const cos = Math.cos(rad), sin = Math.sin(rad);
+          const oldX = rx, oldY = ry;
+          rx = oldX * cos - oldY * sin;
+          ry = oldX * sin + oldY * cos;
+        }
+        const scale = Number(calibration.scale) || 1;
+        rx = rx * scale;
+        ry = ry * scale;
+        xx = rx + pivX + (Number(calibration.offsetX) || 0);
+        yy = ry + pivY + (Number(calibration.offsetY) || 0);
       }
-      const scale = Number(calibration.scale) || 1;
-      xx = xx * scale + (Number(calibration.offsetX) || 0);
-      yy = yy * scale + (Number(calibration.offsetY) || 0);
       // Per-tag override (dx,dy) applicato DOPO la calibrazione globale
       try {
         const ov = (calibration && calibration.tagOverrides) ? calibration.tagOverrides : {};
@@ -487,15 +627,61 @@ EOF`;
           xx += dx; yy += dy;
         }
       } catch(_) {}
+      if (typeof window !== 'undefined' && window.__CALIB_TRACE) {
+        window.__CALIB_LOG = window.__CALIB_LOG || [];
+        if (window.__CALIB_LOG.length > 500) window.__CALIB_LOG.shift();
+        window.__CALIB_LOG.push({ ts: Date.now(), raw: { x, y }, id: idKey, final: { x: xx, y: yy }, params: {
+          rotDeg: calibration.rotationDeg, scale: calibration.scale, offX: calibration.offsetX, offY: calibration.offsetY,
+          invertY: calibration.invertY, swapXY: calibration.swapXY, affine: calibration.affineEnabled ? calibration.affine : null,
+          override: (calibration.tagOverrides && idKey && calibration.tagOverrides[idKey]) ? calibration.tagOverrides[idKey] : null
+        }});
+      }
       return { x: xx, y: yy };
+    };
+
+    // Debug breakdown (raw -> pre -> core -> global -> override) for a single tag
+    const transformBreakdown = (x, y, idKey) => {
+      let rawX = Number(x) || 0; let rawY = Number(y) || 0;
+      // pre
+      let preX = rawX, preY = rawY;
+      if (calibration.swapXY) { const t = preX; preX = preY; preY = t; }
+      if (calibration.invertY) preY = -preY;
+      // core similarity / affine
+      let coreX = preX, coreY = preY;
+      let mode = 'similarity';
+      if (calibration.affineEnabled && calibration.affine && isFinite(calibration.affine.a)) {
+        const A = calibration.affine; mode = 'affine';
+        coreX = (Number(A.a)||0) * preX + (Number(A.b)||0) * preY + (Number(A.tx)||0);
+        coreY = (Number(A.c)||0) * preX + (Number(A.d)||0) * preY + (Number(A.ty)||0);
+      } else {
+        const rad = (Number(calibration.rotationDeg) || 0) * Math.PI / 180;
+        const pivX = Number(calibration.pivotX) || 0;
+        const pivY = Number(calibration.pivotY) || 0;
+        let rx = preX - pivX; let ry = preY - pivY;
+        if (rad) { const cos = Math.cos(rad), sin = Math.sin(rad); const ox = rx, oy = ry; rx = ox*cos - oy*sin; ry = ox*sin + oy*cos; }
+        const scale = Number(calibration.scale) || 1;
+        rx *= scale; ry *= scale;
+        coreX = rx + pivX; coreY = ry + pivY;
+      }
+      // global offsets
+      let globX = coreX + (Number(calibration.offsetX)||0);
+      let globY = coreY + (Number(calibration.offsetY)||0);
+      // overrides
+      let finalX = globX; let finalY = globY;
+      try { const ov = calibration.tagOverrides || {}; const key = String(idKey||''); if (key && ov[key]) { finalX += Number(ov[key].dx)||0; finalY += Number(ov[key].dy)||0; } } catch(_) {}
+      return { rawX, rawY, preX, preY, coreX, coreY, globX, globY, finalX, finalY, mode };
     };
     // Filtra per recenti
     // Canonicalizza ID per evitare duplicati usando il canonicalizer centralizzato (preferisce HEX completo)
     const canonicalMap = {}; // canonKey -> entry
     Object.entries(positions).forEach(([tagId, pos]) => {
-      if (!pos || !pos.ts) return;
-      const age = now - pos.ts;
-      if (age > ACTIVE_WINDOW_MS) return;
+      if (!pos) return;
+      const ts = (pos.ts && isFinite(pos.ts)) ? pos.ts : (lastSeenRef[tagId] || Date.now());
+      lastSeenRef[tagId] = ts;
+      const age = now - ts;
+      // Se mancano aggiornamenti per molto tempo lasciamo comunque il tag visibile più a lungo (60s) prima di rimuoverlo
+      const WINDOW = (pos.ts && isFinite(pos.ts)) ? ACTIVE_WINDOW_MS : 60000;
+      if (age > WINDOW) return;
       const canon = canonicalizeId(tagId);
       const t = applyTransform(pos.x, pos.y, canon);
       const entry = {
@@ -508,13 +694,33 @@ EOF`;
         type: 'unknown',
         entityId: null,
         ageMs: age,
+        _blinkAge: age,
       };
       // Se già presente stesso canon, tieni quello più recente
       if (!canonicalMap[canon] || (canonicalMap[canon].ts < entry.ts)) {
         canonicalMap[canon] = entry;
       }
     });
-    positionsWithInfo = Object.values(canonicalMap);
+    positionsWithInfo = Object.values(canonicalMap).map(p => {
+      if (forceClamp && mapBounds) {
+        const b = mapBounds;
+        const cx = Math.max(b.min.x, Math.min(b.max.x, p.x));
+        const cy = Math.max(b.min.y, Math.min(b.max.y, p.y));
+        return { ...p, x: cx, y: cy, __clamped: true };
+      }
+      return p;
+    });
+
+    // Attach breakdown to selected tag for debug overlay (window.__TRANSFORM_DEBUG flag)
+    try {
+      if (typeof window !== 'undefined' && window.__TRANSFORM_DEBUG && selectedTag) {
+        const sel = positionsWithInfo.find(p => p.canonId === selectedTag || p.tagId === selectedTag);
+        if (sel) {
+          sel.__breakdown = transformBreakdown(sel.rawX ?? sel.x, sel.rawY ?? sel.y, sel.canonId);
+          window.__TRANSFORM_LAST = sel.__breakdown;
+        }
+      }
+    } catch(_) {}
 
     // Ordina per timestamp decrescente
     positionsWithInfo.sort((a, b) => b.ts - a.ts);
@@ -590,10 +796,23 @@ EOF`;
       mapObj["TAG002"] = { id: "TAG002", x: 65.7, y: 42.6, z: 0, name: "Gru 002", type: "asset", entityId: 10, ts: now };
     }
 
-    setEnhancedPositions(mapObj);
+    // Evita rimozione/aggiunta rapida che causa lampeggio: conserva ultimo stato e aggiorna solo campi mutati
+    setEnhancedPositions(prev => {
+      const next = { ...prev };
+      // Rimuovi solo se assente da mapObj da oltre 90s
+      const now2 = Date.now();
+      Object.keys(next).forEach(k => {
+        if (!mapObj[k]) {
+          const last = (lastSeenRef[k] || now2);
+          if (now2 - last > 90000) delete next[k];
+        }
+      });
+      Object.entries(mapObj).forEach(([k,v]) => { next[k] = v; });
+      return next;
+    });
     try { window.__DEBUG_RAW = rawObj; } catch(_) {}
     console.log("Tag positions enhanced:", Object.keys(mapObj).length, "(active recent=", totalActive, "truncated to", MAX_TAGS, ")");
-  }, [positions, tagAssociations, employees, assets, isConnected, tagNames, calibration, useRawPositions]);
+  }, [positions, tagAssociations, employees, assets, isConnected, tagNames, calibration, useRawPositions, selectedTag, forceClamp, mapBounds]);
 
   // Auto-hide toast after a short delay
   useEffect(() => {
@@ -609,22 +828,73 @@ EOF`;
       if (!mapBounds || keys.length === 0) return { total: 0, off: 0, frac: 0 };
       const b = mapBounds;
       let off = 0;
+      const offList = [];
       keys.forEach(k => {
         const p = enhancedPositions[k];
         if (!p) return;
-        if (p.x < b.min.x || p.x > b.max.x || p.y < b.min.y || p.y > b.max.y) off += 1;
+        if (p.x < b.min.x || p.x > b.max.x || p.y < b.min.y || p.y > b.max.y) {
+          off += 1;
+          offList.push({ id: k, x: p.x, y: p.y, ts: p.ts });
+        }
       });
-      return { total: keys.length, off, frac: keys.length ? (off / keys.length) : 0 };
+      return { total: keys.length, off, frac: keys.length ? (off / keys.length) : 0, list: offList };
     } catch (_) { return { total: 0, off: 0, frac: 0 }; }
   })();
 
   // When fraction high, auto-show suggestion banner (but don't auto-apply)
+  // Throttle banner visibility to reduce flicker
   useEffect(() => {
-    try {
-      if (offMapStats.total > 0 && offMapStats.frac >= 0.5) setSuggestionVisible(true);
-      else setSuggestionVisible(false);
-    } catch(_) { setSuggestionVisible(false); }
-  }, [offMapStats.total, offMapStats.frac]);
+    const now = Date.now();
+    const st = lastBannerRef.current;
+    const THRESH = 0.5; // fraction outside to trigger
+    const MIN_SHOW_MS = 2500; // keep visible at least this long once shown
+    const MIN_HIDE_MS = 1500; // delay re-show at least this long after hide
+    const trigger = offMapStats.total > 0 && offMapStats.frac >= THRESH;
+    if (trigger) {
+      // show if not visible and past hide cooldown
+      if (!suggestionVisible && (now - st.hiddenAt) > MIN_HIDE_MS) {
+        setSuggestionVisible(true);
+        st.shownAt = now;
+        st.forceHoldUntil = now + MIN_SHOW_MS;
+      }
+    } else {
+      // hide only if minimum show duration elapsed
+      if (suggestionVisible && now >= st.forceHoldUntil) {
+        setSuggestionVisible(false);
+        st.hiddenAt = now;
+      }
+    }
+  }, [offMapStats.total, offMapStats.frac, suggestionVisible]);
+
+  // Auto-initial calibration after a full reset: center raw tag cluster in map
+  useEffect(() => {
+    if (autoInitDone) return;
+    if (!mapBounds) return;
+    const keys = Object.keys(positions || {});
+    if (keys.length === 0) return;
+    const calib = calibration || {};
+    const isNearDefault = (
+      Math.abs((calib.scale||1) - 1) < 1e-6 &&
+      Math.abs(calib.rotationDeg||0) < 1e-6 &&
+      Math.abs(calib.offsetX||0) < 1e-6 &&
+      Math.abs(calib.offsetY||0) < 1e-6 &&
+      !calib.affineEnabled &&
+      (!calib.referencePoints || calib.referencePoints.length === 0) &&
+      Object.keys(calib.tagOverrides||{}).length === 0
+    );
+    if (!isNearDefault) return; // non è uno stato post-reset
+    // calcola centro cluster RAW
+    let sumX=0,sumY=0,n=0;
+    keys.forEach(k => { const p = positions[k]; if (!p) return; const x=Number(p.x)||0; const y=Number(p.y)||0; sumX+=x; sumY+=y; n++; });
+    if (n === 0) return;
+    const cx = sumX / n; const cy = sumY / n;
+    const mapCenterX = ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2;
+    const mapCenterY = ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2;
+    const offsetX = mapCenterX - cx;
+    const offsetY = mapCenterY - cy;
+    updateCalibration({ offsetX, offsetY, pivotX: cx, pivotY: cy });
+    setAutoInitDone(true);
+  }, [autoInitDone, calibration, positions, mapBounds, updateCalibration]);
 
   const computeSuggestedOffsets = () => {
     if (!mapBounds) return null;
@@ -653,6 +923,36 @@ EOF`;
   const onSuggestPreview = () => {
     const s = computeSuggestedOffsets();
     setSuggestedOffsets(s);
+  };
+
+  // Stima scala e offset usando bounding box del cluster RAW
+  const autoFitCluster = () => {
+    try {
+      const keys = Object.keys(positions||{});
+      if (!mapBounds || keys.length < 2) { alert('Servono almeno 2 tag attivi per auto-fit'); return; }
+      let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity; let sumX=0,sumY=0,n=0;
+      keys.forEach(k => { const p=positions[k]; if (!p) return; const x=Number(p.x)||0; const y=Number(p.y)||0; if (x<minX)minX=x; if (y<minY)minY=y; if (x>maxX)maxX=x; if (y>maxY)maxY=y; sumX+=x; sumY+=y; n++; });
+      if (n<2) { alert('Cluster insufficiente'); return; }
+      const rawW = Math.max(0.0001, maxX-minX);
+      const rawH = Math.max(0.0001, maxY-minY);
+      const mapW = Math.max(0.0001, (Number(mapBounds.max?.x)||0) - (Number(mapBounds.min?.x)||0));
+      const mapH = Math.max(0.0001, (Number(mapBounds.max?.y)||0) - (Number(mapBounds.min?.y)||0));
+      // uniform scale fit (riempie l'asse dominante senza superare l'altra) con margine 5%
+      const scaleX = mapW / rawW;
+      const scaleY = mapH / rawH;
+      const scale = Math.min(scaleX, scaleY) * 0.95; // margine
+      const cx = sumX / n; const cy = sumY / n;
+      const mapCenterX = ((Number(mapBounds.min?.x)||0) + (Number(mapBounds.max?.x)||0)) / 2;
+      const mapCenterY = ((Number(mapBounds.min?.y)||0) + (Number(mapBounds.max?.y)||0)) / 2;
+      // offset per posizionare il centro trasformato al centro mappa
+      // similarity senza rotazione: x' = scale*(x-cx)+cx + offX
+      // imponi media x' = mapCenterX => offX = mapCenterX - cx
+      const offX = mapCenterX - cx;
+      const offY = mapCenterY - cy;
+      updateCalibration({ scale, offsetX: offX, offsetY: offY, rotationDeg: 0, pivotX: cx, pivotY: cy, invertY: false, swapXY: false });
+      try { setToast({ type:'success', msg:`Auto-fit: scale=${scale.toFixed(3)} offset=(${offX.toFixed(1)},${offY.toFixed(1)})` }); } catch(_) {}
+    } catch(e) {
+      alert('Auto-fit fallito: '+(e?.message||'')); }
   };
 
   // Gestisce la selezione di un tag (click da mappa o lista)
@@ -741,6 +1041,7 @@ EOF`;
             <div className="flex items-center gap-2">
               <button onClick={onSuggestPreview} className="px-2 py-1 bg-indigo-600 text-white rounded text-sm">Suggerisci offset</button>
               <button onClick={() => setSuggestionVisible(false)} className="px-2 py-1 bg-gray-200 rounded text-sm">Chiudi</button>
+              <button onClick={autoFitCluster} className="px-2 py-1 bg-emerald-600 text-white rounded text-sm" title="Stima scala e offset dal cluster RAW dei tag">Auto-fit cluster</button>
             </div>
           </div>
         )}
@@ -770,6 +1071,15 @@ EOF`;
       </div>
 
       {/* Barra superiore semplificata */}
+      {calibrationDirty && (
+        <div className="mb-3 p-3 border-2 border-amber-500 bg-amber-50 rounded flex items-center justify-between shadow-sm">
+          <div className="text-sm font-medium text-amber-800">Calibrazione modificata. Salva per renderla permanente.</div>
+          <button
+            onClick={() => { saveCalibration().then(ok => { try { setToast({ type: ok?'success':'error', msg: ok?'Calibrazione salvata':'Errore salvataggio' }); } catch(_) {} }); }}
+            className="px-4 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-sm rounded font-semibold shadow"
+          >Salva calibrazione</button>
+        </div>
+      )}
       <div className="mb-3 flex items-center gap-2">
         <button className="px-3 py-1 bg-gray-700 text-white rounded" onClick={()=> setSimpleMode(!simpleMode)}>
           {simpleMode ? 'Modalità Avanzata' : 'Modalità Semplice'}
@@ -782,6 +1092,14 @@ EOF`;
       <div className="mb-4 text-xs text-gray-700 bg-gray-50 border rounded p-3 space-y-2">
         <div className="font-medium">Debug BlueIOT</div>
         <div>Tag attivi: {Object.keys(enhancedPositions).length}</div>
+        {mapBounds && (
+          <div>
+            Fuori mappa: <span className={offMapStats.off>0? 'text-rose-600 font-semibold':'text-gray-600'}>{offMapStats.off}</span>
+            {offMapStats.off>0 && (
+              <span className="ml-2 text-[11px] text-gray-600">[{offMapStats.list.slice(0,5).map(o=> o.id).join(', ')}{offMapStats.off>5?'…':''}]</span>
+            )}
+          </div>
+        )}
         <div className="flex flex-wrap gap-3 items-center text-xs">
           <span>Calibrazione:</span>
           <label className="flex items-center gap-1 mr-2">
@@ -797,10 +1115,32 @@ EOF`;
             onBlur={e => updateCalibration({ offsetY: Number(e.target.value) || 0 })} /></label>
           <label>Rot° <input type="number" step="1" defaultValue={calibration.rotationDeg} className="border px-1 w-14"
             onBlur={e => updateCalibration({ rotationDeg: Number(e.target.value) || 0 })} /></label>
+          <label>MapRot° <input type="number" step="1" defaultValue={calibration.visualMapRotationDeg} className="border px-1 w-14"
+            onBlur={e => updateCalibration({ visualMapRotationDeg: Number(e.target.value) || 0 })} /></label>
+          <button className="px-2 py-1 bg-gray-300 rounded" title="Ruota mappa -90°" onClick={() => updateCalibration({ visualMapRotationDeg: (((calibration.visualMapRotationDeg||0) - 90) % 360 + 360) % 360 })}>⟲ -90°</button>
+          <button className="px-2 py-1 bg-gray-300 rounded" title="Ruota mappa +90°" onClick={() => updateCalibration({ visualMapRotationDeg: (((calibration.visualMapRotationDeg||0) + 90) % 360 + 360) % 360 })}>⟳ +90°</button>
           <label className="flex items-center gap-1"><input type="checkbox" defaultChecked={calibration.invertY}
             onChange={e => updateCalibration({ invertY: e.target.checked })} /> invertY</label>
           <label className="flex items-center gap-1"><input type="checkbox" defaultChecked={calibration.swapXY}
             onChange={e => updateCalibration({ swapXY: e.target.checked })} /> swapXY</label>
+          <span className="mx-2 h-5 w-px bg-gray-300 inline-block" />
+          <span>Tracking:</span>
+          <label className="flex items-center gap-1 mr-2"><input type="checkbox" checked={!!calibration.trackingEnabled} onChange={e => updateCalibration({ trackingEnabled: e.target.checked })} /> Kalman</label>
+          <label className="flex items-center gap-1">Reattività
+            <input type="range" min={0} max={1} step={0.05} defaultValue={calibration.trackingResponsiveness ?? 0.5} className="ml-1"
+              onChange={e => updateCalibration({ trackingResponsiveness: Number(e.target.value) })} />
+          </label>
+          <label className="flex items-center gap-1">Outlier
+            <input type="range" min={0} max={1} step={0.05} defaultValue={calibration.outlierSensitivity ?? 0.5} className="ml-1"
+              onChange={e => updateCalibration({ outlierSensitivity: Number(e.target.value) })} />
+          </label>
+          <label>Deadband cm <input type="number" step="1" defaultValue={Math.round((calibration.deadbandM ?? 0.06)*100)} className="border px-1 w-16"
+            onBlur={e => updateCalibration({ deadbandM: Math.max(0, Number(e.target.value)/100) })} /></label>
+          <button
+            className="px-2 py-1 bg-indigo-600 text-white rounded"
+            title="Applica preset consigliato per tracking e outlier"
+            onClick={() => updateCalibration({ trackingEnabled: true, trackingResponsiveness: 0.65, outlierSensitivity: 0.7, deadbandM: 0.10 })}
+          >Preset tracking</button>
           <div className="flex items-center gap-2 ml-auto">
             <button className="px-2 py-1 bg-emerald-600 text-white rounded" onClick={() => saveCalibration()}>Salva</button>
             <button className="px-2 py-1 bg-sky-600 text-white rounded" onClick={() => loadCalibration()}>Ricarica</button>
@@ -852,6 +1192,94 @@ EOF`;
                 : _lastRawFrame.text
               : "—"}
           </pre>
+        </div>
+
+        {/* Diagnostica posizioni (tabella eventi) */}
+        <div className="mt-3 p-3 border rounded bg-white">
+          <div className="flex items-center justify-between mb-2">
+            <div className="font-medium">Diagnostica posizioni</div>
+            <div className="flex gap-2">
+              <input
+                className="border px-2 py-1 rounded w-40"
+                placeholder="Filtro Tag (canon)"
+                value={diagTagFilter}
+                onChange={(e)=> setDiagTagFilter(e.target.value)}
+              />
+              <input
+                type="number"
+                className="border px-2 py-1 rounded w-24"
+                title="Numero massimo righe"
+                value={diagLimit}
+                onChange={(e)=> setDiagLimit(Math.max(10, Math.min(2000, Number(e.target.value)||200)))}
+              />
+              <button
+                className={`px-2 py-1 rounded ${diagPaused?'bg-gray-500 text-white':'bg-gray-700 text-white'}`}
+                onClick={()=> { setDiagPaused(!diagPaused); setDiagnosticsPaused(!diagPaused); }}
+              >{diagPaused? 'Riprendi' : 'Pausa'}</button>
+              <button className="px-2 py-1 bg-rose-600 text-white rounded" onClick={()=> clearDiagnostics()}>Pulisci</button>
+              <button
+                className="px-2 py-1 bg-indigo-600 text-white rounded"
+                onClick={()=>{
+                  try {
+                    const csv = window.__BLUEIOT_POS_DIAG?.exportCSV?.(diagTagFilter||null, 2000) || '';
+                    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = `posdiag_${diagTagFilter||'ALL'}_${Date.now()}.csv`;
+                    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+                  } catch(e) { console.error(e); }
+                }}
+              >Export CSV</button>
+            </div>
+          </div>
+          {(() => {
+            try {
+              const rows = getDiagnostics({ tag: diagTagFilter || null, limit: diagLimit });
+              return (
+                <div className="max-h-60 overflow-auto border rounded">
+                  <table className="w-full text-[11px]">
+                    <thead className="bg-gray-100 sticky top-0">
+                      <tr>
+                        <th className="text-left px-2 py-1">Ora</th>
+                        <th className="text-left px-2 py-1">Tag</th>
+                        <th className="text-left px-2 py-1">Azione</th>
+                        <th className="text-left px-2 py-1">Filtro</th>
+                        <th className="text-left px-2 py-1">Raw (x,y)</th>
+                        <th className="text-left px-2 py-1">Smooth (x,y)</th>
+                        <th className="text-left px-2 py-1">Jump</th>
+                        <th className="text-left px-2 py-1">Speed</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r, idx) => {
+                        const t = new Date(r.ts||Date.now());
+                        const hh = String(t.getHours()).padStart(2,'0');
+                        const mm = String(t.getMinutes()).padStart(2,'0');
+                        const ss = String(t.getSeconds()).padStart(2,'0');
+                        const ms = String(t.getMilliseconds()).padStart(3,'0');
+                        const time = `${hh}:${mm}:${ss}.${ms}`;
+                        const warn = r.action === 'reject-outlier';
+                        return (
+                          <tr key={idx} className={warn? 'bg-rose-50' : ''}>
+                            <td className="px-2 py-1 whitespace-nowrap">{time}</td>
+                            <td className="px-2 py-1">{r.id}</td>
+                            <td className="px-2 py-1">{r.action||''}</td>
+                            <td className="px-2 py-1">{r.filter||''}</td>
+                            <td className="px-2 py-1">{isFinite(r.raw?.x)?r.raw.x.toFixed(2):''}, {isFinite(r.raw?.y)?r.raw.y.toFixed(2):''}</td>
+                            <td className="px-2 py-1">{isFinite(r.smooth?.x)?r.smooth.x.toFixed(2):''}, {isFinite(r.smooth?.y)?r.smooth.y.toFixed(2):''}</td>
+                            <td className="px-2 py-1">{isFinite(r.jump)?r.jump.toFixed(2):''}</td>
+                            <td className="px-2 py-1">{isFinite(r.speed)?r.speed.toFixed(2):''}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            } catch(e) {
+              return <div className="text-red-600">Errore diagnostica: {String(e?.message||e)}</div>;
+            }
+          })()}
         </div>
 
         {/* Calibrazione scala con misura reale (singolo tag) */}
@@ -1017,9 +1445,12 @@ EOF`;
                 <DxfViewer
                   data={mapData}
                   height="100%"
+                  visualRotationDeg={calibration.visualMapRotationDeg || 0}
                   tagPositions={isolateSelected && selectedTag && enhancedPositions[selectedTag] ? { [selectedTag]: enhancedPositions[selectedTag] } : enhancedPositions}
+                  referencePoints={showRefPoints ? (calibration?.referencePoints || []) : []}
                   debugRawPositions={useRawPositions ? {} : (typeof window !== 'undefined' ? (isolateSelected && selectedTag && window.__DEBUG_RAW && window.__DEBUG_RAW[selectedTag] ? { [selectedTag]: window.__DEBUG_RAW[selectedTag] } : window.__DEBUG_RAW || {}) : {})}
                   showTagsMessage={true}
+                  areas={(() => { try { const raw = localStorage.getItem('logicalAreas_v1'); if (raw) { const arr = JSON.parse(raw); if (Array.isArray(arr)) return arr; } } catch(_) {} return []; })()}
                   focusPoint={(function(){
                     if (!followSelected || !selectedTag) return null;
                     const direct = enhancedPositions[selectedTag];
@@ -1061,8 +1492,94 @@ EOF`;
               </button>
             </div>
           )}
+          {/* Debug trasformazione selezionato */}
+          {selectedTag && typeof window !== 'undefined' && window.__TRANSFORM_DEBUG && (
+            (() => {
+              const bd = window.__TRANSFORM_LAST;
+              if (!bd) return null;
+              const fmt = (v) => (v===undefined||v===null||!isFinite(v)? '—' : v.toFixed(2));
+              return (
+                <div className="mt-2 p-2 border rounded bg-white text-[11px]">
+                  <div className="font-semibold mb-1">Breakdown trasformazione (tag {selectedTag})</div>
+                  <div className="grid grid-cols-6 gap-x-2 gap-y-1">
+                    <div className="col-span-2 text-gray-600">Raw</div><div className="col-span-4">{fmt(bd.rawX)}, {fmt(bd.rawY)}</div>
+                    <div className="col-span-2 text-gray-600">Pre</div><div className="col-span-4">{fmt(bd.preX)}, {fmt(bd.preY)}</div>
+                    <div className="col-span-2 text-gray-600">Core</div><div className="col-span-4">{fmt(bd.coreX)}, {fmt(bd.coreY)} ({bd.mode})</div>
+                    <div className="col-span-2 text-gray-600">Glob</div><div className="col-span-4">{fmt(bd.globX)}, {fmt(bd.globY)}</div>
+                    <div className="col-span-2 text-gray-600">Finale</div><div className="col-span-4">{fmt(bd.finalX)}, {fmt(bd.finalY)}</div>
+                  </div>
+                  <div className="mt-1 text-[10px] text-gray-500">Attiva/disattiva in console: <code>window.__TRANSFORM_DEBUG = false/true</code></div>
+                </div>
+              );
+            })()
+          )}
+          {/* Pannello accuratezza calibrazione (residui ultimi punti di riferimento) */}
+          {calibration && Array.isArray(calibration.lastResiduals) && calibration.lastResiduals.length>0 && (
+            (() => {
+              const residuals = calibration.lastResiduals;
+              const errs = residuals.map(r => Number(r.err)||0);
+              const mean = errs.reduce((a,b)=>a+b,0)/errs.length;
+              const sorted = errs.slice().sort((a,b)=>a-b);
+              const median = sorted[Math.floor(sorted.length/2)] || 0;
+              const max = Math.max(...errs);
+              const thresh = median * 2;
+              const outliers = residuals.filter(r => (r.err||0) > thresh);
+              const worst = residuals.slice().sort((a,b)=>b.err - a.err).slice(0,5);
+              const recomputeResiduals = () => {
+                if (!calibration.referencePoints) return;
+                const pts = calibration.referencePoints;
+                const newR = [];
+                pts.forEach(pt => {
+                  const raw = positions[pt.id]; if (!raw) return;
+                  let xx = Number(raw.x)||0; let yy = Number(raw.y)||0;
+                  if (calibration.swapXY) { const t=xx; xx=yy; yy=t; }
+                  if (calibration.invertY) yy = -yy;
+                  if (calibration.affineEnabled && calibration.affine && isFinite(calibration.affine.a)) {
+                    const A = calibration.affine;
+                    const x2 = (Number(A.a)||0)*xx + (Number(A.b)||0)*yy + (Number(A.tx)||0);
+                    const y2 = (Number(A.c)||0)*xx + (Number(A.d)||0)*yy + (Number(A.ty)||0);
+                    xx = x2; yy = y2;
+                  } else {
+                    const rad = (Number(calibration.rotationDeg)||0)*Math.PI/180;
+                    const pivX = Number(calibration.pivotX)||0; const pivY = Number(calibration.pivotY)||0;
+                    let rx = xx - pivX; let ry = yy - pivY;
+                    if (rad) { const cos=Math.cos(rad), sin=Math.sin(rad); const ox=rx, oy=ry; rx=ox*cos - oy*sin; ry=ox*sin + oy*cos; }
+                    const sc = Number(calibration.scale)||1; rx*=sc; ry*=sc;
+                    xx = rx + pivX + (Number(calibration.offsetX)||0);
+                    yy = ry + pivY + (Number(calibration.offsetY)||0);
+                  }
+                  try { const ov=calibration.tagOverrides||{}; const k=String(pt.id); if (ov[k]) { xx+=Number(ov[k].dx)||0; yy+=Number(ov[k].dy)||0; } } catch(_) {}
+                  const dx = Number(pt.mapX) - xx; const dy = Number(pt.mapY) - yy;
+                  newR.push({ id: pt.id, dx, dy, err: Math.hypot(dx,dy) });
+                });
+                updateCalibration({ lastResiduals: newR });
+              };
+              return (
+                <div className="mt-2 p-2 border rounded bg-white text-[11px]">
+                  <div className="font-semibold mb-1">Accuratezza calibrazione</div>
+                  <div className="flex flex-wrap gap-3">
+                    <span>Mean: {mean.toFixed(2)}</span>
+                    <span>Median: {median.toFixed(2)}</span>
+                    <span>Max: {max.toFixed(2)}</span>
+                    <span>Outliers (&gt;2×med): {outliers.length}</span>
+                  </div>
+                  <div className="mt-1">Peggiori (top 5): {worst.map(r => `${r.id}:${r.err.toFixed(2)}${r.err>thresh?'*':''}`).join(' | ')}</div>
+                  <div className="mt-1 text-[10px] text-gray-500">'*' = oltre soglia {thresh.toFixed(2)}</div>
+                  <div className="mt-2 flex gap-2">
+                    <button className="px-2 py-1 bg-indigo-600 text-white rounded" onClick={recomputeResiduals} title="Ricalcola residui sui punti di riferimento memorizzati">Ricalcola precisione</button>
+                  </div>
+                </div>
+              );
+            })()
+          )}
           {/* Auto calibration block (solo avanzata) */}
           {!simpleMode && <AutoCalibration />}
+          {calibration?.referencePoints?.length>0 && (
+            <div className="mt-2 flex items-center gap-2 text-[11px]">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={showRefPoints} onChange={e=> setShowRefPoints(e.target.checked)} /> Mostra punti riferimento</label>
+              <span className="text-gray-500">({calibration.referencePoints.length})</span>
+            </div>
+          )}
           <div className="mt-2 text-sm text-gray-500 flex flex-wrap gap-4">
             <div><span className="inline-block w-3 h-3 bg-blue-500 rounded-full mr-1"></span> Dipendenti</div>
             <div><span className="inline-block w-3 h-3 bg-green-500 rounded-full mr-1"></span> Asset</div>

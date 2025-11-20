@@ -62,8 +62,17 @@ export function canonicalizeId(rawId) {
   const hx = normHex(s);
   if (hx) {
     if (variantToCanon.has(hx)) return variantToCanon.get(hx);
-    // Prefer full normalized HEX as canonical when available (e.g., 12-byte like C5D566E015E5)
-    if (hx.length >= 8) return hx; // keep full hex, not just low32
+    // Nuova strategia: per uniformare ID tra posizioni e nomi, preferisci sempre il low32 decimale
+    if (hx.length >= 8) {
+      try {
+        const low32Dec = String(parseInt(hx.slice(-8), 16) >>> 0);
+        // Se abbiamo già una mappatura per low32 dec, restituiscila; altrimenti usa direttamente low32 dec
+        return variantToCanon.has(low32Dec) ? variantToCanon.get(low32Dec) : low32Dec;
+      } catch(_) {
+        // fallback: se parsing fallisce, torna hex
+        return hx;
+      }
+    }
   }
   // numeric fallback: return low32 decimal string
   if (/^[0-9]+$/.test(s)) {
