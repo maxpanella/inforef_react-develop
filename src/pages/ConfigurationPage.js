@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
 	fetchUsersFromCRM,
 	fetchAssetsFromCRM,
@@ -55,6 +55,7 @@ const ConfigurationPage = () => {
 
 	const { tags, employees, assets, associateTag, currentSite, refreshData } =
 		useData();
+	const autoImportAttemptedRef = useRef(false);
 
 	const cacheImportedData = (usersList = [], assetsList = []) => {
 		if (typeof window === 'undefined' || !window.localStorage) return;
@@ -199,12 +200,16 @@ const ConfigurationPage = () => {
 
 	// Auto-import on component mount only if backend has no data yet
 	useEffect(() => {
-		const initializeData = async () => {
-			if (!currentSite) return;
+		if (!currentSite || autoImportAttemptedRef.current) return;
 
+		autoImportAttemptedRef.current = true;
+
+		const initializeData = async () => {
+			const cachedUsers = readCachedArray(CRM_USERS_STORAGE_KEY);
+			const cachedAssets = readCachedArray(CRM_ASSETS_STORAGE_KEY);
 			const hasCachedData =
-				(Array.isArray(crmUsers) && crmUsers.length > 0) ||
-				(Array.isArray(crmAssets) && crmAssets.length > 0);
+				(Array.isArray(cachedUsers) && cachedUsers.length > 0) ||
+				(Array.isArray(cachedAssets) && cachedAssets.length > 0);
 
 			if (hasCachedData) {
 				return;
@@ -216,8 +221,10 @@ const ConfigurationPage = () => {
 			}
 		};
 
-		initializeData();
-	}, [currentSite, crmUsers, crmAssets]);
+		initializeData().catch((error) =>
+			console.error('Errore durante la inizializzazione automatica:', error)
+		);
+	}, [currentSite]);
 
 	return (
 		<div className='p-6'>

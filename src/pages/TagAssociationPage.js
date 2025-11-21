@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useData } from '../context/DataContext';
 
 const CRM_USERS_STORAGE_KEY = 'crm_cached_users';
@@ -29,11 +29,22 @@ const persistCachedArray = (key, value = []) => {
 };
 
 const TagAssociationPage = () => {
-	const { tags, employees, assets, tagAssociations, associateTag } = useData();
+	const {
+		tags,
+		employees,
+		assets,
+		tagAssociations,
+		associateTag,
+		dissociateTag,
+		currentSite,
+	} = useData();
 	const [selectedTag, setSelectedTag] = useState('');
 	const [selectedEntity, setSelectedEntity] = useState('');
 	const [entityType, setEntityType] = useState('employee');
 	const [message, setMessage] = useState('');
+	const [messageType, setMessageType] = useState('');
+	const [isSubmitting, setIsSubmitting] = useState(false);
+	const [dissociatingTag, setDissociatingTag] = useState(null);
 	const [localEmployees, setLocalEmployees] = useState(() =>
 		Array.isArray(employees) && employees.length > 0
 			? employees
@@ -69,15 +80,84 @@ const TagAssociationPage = () => {
 		}
 	}, [assets]);
 
-	const handleAssociate = () => {
-		if (selectedTag && selectedEntity) {
-			associateTag(selectedTag, entityType, parseInt(selectedEntity));
+	const assignedTagIds = useMemo(() => {
+		return new Set(tagAssociations.map((assoc) => String(assoc.tagId)));
+	}, [tagAssociations]);
+
+	const availableTags = useMemo(() => {
+		return tags.filter((tag) => !assignedTagIds.has(String(tag.id)));
+	}, [tags, assignedTagIds]);
+
+	useEffect(() => {
+		if (selectedTag && assignedTagIds.has(String(selectedTag))) {
+			setSelectedTag('');
+		}
+	}, [assignedTagIds, selectedTag]);
+
+	const handleAssociate = async () => {
+		if (!selectedTag || !selectedEntity) {
+			setMessage('Seleziona un tag e un elemento da associare.');
+			setMessageType('error');
+			return;
+		}
+
+		if (!currentSite?.id) {
+			setMessage('Seleziona prima un sito.');
+			setMessageType('error');
+			return;
+		}
+
+		setIsSubmitting(true);
+		setMessage('');
+		setMessageType('');
+
+		try {
+			await associateTag(selectedTag, entityType, parseInt(selectedEntity, 10));
 			setMessage('Tag associato con successo.');
+			setMessageType('success');
+			setSelectedEntity('');
+			setSelectedTag('');
+		} catch (error) {
+			console.error('Errore durante la creazione associazione:', error);
+			setMessage(
+				error?.message || "Si è verificato un errore durante l'associazione."
+			);
+			setMessageType('error');
+		} finally {
+			setIsSubmitting(false);
 		}
 	};
 
 	const availableEntities =
 		entityType === 'employee' ? localEmployees : localAssets;
+
+	const handleDissociate = async (tagId) => {
+		if (!tagId) return;
+
+		if (!currentSite?.id) {
+			setMessage('Seleziona prima un sito.');
+			setMessageType('error');
+			return;
+		}
+
+		setDissociatingTag(tagId);
+		setMessage('');
+		setMessageType('');
+
+		try {
+			await dissociateTag(tagId);
+			setMessage(`Tag ${tagId} dissociato con successo.`);
+			setMessageType('success');
+		} catch (error) {
+			console.error('Errore durante la dissociazione tag:', error);
+			setMessage(
+				error?.message || "Si è verificato un errore durante la dissociazione."
+			);
+			setMessageType('error');
+		} finally {
+			setDissociatingTag(null);
+		}
+	};
 
 	return (
 		<div className='p-6'>
@@ -89,14 +169,21 @@ const TagAssociationPage = () => {
 						className='w-full border rounded p-2'
 						value={selectedTag}
 						onChange={(e) => setSelectedTag(e.target.value)}
+						disabled={availableTags.length === 0}
 					>
 						<option value=''>-- Seleziona Tag --</option>
-						{tags.map((tag) => (
+						{availableTags.map((tag) => (
 							<option key={tag.id} value={tag.id}>
 								{tag.id}
 							</option>
 						))}
 					</select>
+					{availableTags.length === 0 && (
+						<p className='text-xs text-gray-500 mt-1'>
+							Tutti i tag sono già associati. Dissocia un tag per renderlo
+							nuovamente disponibile.
+						</p>
+					)}
 				</div>
 				<div>
 					<label className='block font-medium'>Tipo:</label>
@@ -126,29 +213,63 @@ const TagAssociationPage = () => {
 				</div>
 				<button
 					onClick={handleAssociate}
-					className='bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700'
+					className={`bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 ${
+						isSubmitting ? 'opacity-50 cursor-not-allowed' : ''
+					}`}
+					disabled={isSubmitting}
 				>
-					Associa
+					{isSubmitting ? 'Associazione...' : 'Associa'}
 				</button>
 				{message && (
-					<div className='mt-4 text-green-700 font-medium'>{message}</div>
+					<div
+						className={`mt-4 font-medium ${
+							messageType === 'error' ? 'text-red-700' : 'text-green-700'
+						}`}
+					>
+						{message}
+					</div>
 				)}
 			</div>
 
 			<div className='mt-8'>
 				<h2 className='text-lg font-semibold mb-2'>Tag Associati</h2>
 				<div className='bg-white p-4 rounded shadow'>
-					{tagAssociations.map((a) => {
-						const entityList =
-							a.targetType === 'employee' ? localEmployees : localAssets;
-						const entity = entityList.find((e) => e.id === a.targetId);
-						return (
-							<div key={a.tagId} className='border-b py-2'>
-								<strong>{a.tagId}</strong> — {entity?.name || 'N/A'} (
-								{a.targetType})
-							</div>
-						);
-					})}
+					{tagAssociations.length === 0 ? (
+						<p className='text-gray-500 text-sm'>
+							Nessuna associazione presente per questo sito.
+						</p>
+					) : (
+						tagAssociations.map((a) => {
+							const entityList =
+								a.targetType === 'employee' ? localEmployees : localAssets;
+							const entity = entityList.find((e) => e.id === a.targetId);
+							const entityName = entity?.name || a.targetName || 'N/A';
+
+							return (
+								<div
+									key={`${a.tagId}-${a.targetId}-${a.targetType}`}
+									className='flex items-center justify-between border-b py-2'
+								>
+									<div>
+										<strong>{a.tagId}</strong> - {entityName} ({a.targetType})
+									</div>
+									<button
+										onClick={() => handleDissociate(a.tagId)}
+										disabled={dissociatingTag === a.tagId}
+										className={`text-sm text-red-600 hover:underline ${
+											dissociatingTag === a.tagId
+												? 'opacity-50 cursor-not-allowed'
+												: ''
+										}`}
+									>
+										{dissociatingTag === a.tagId
+											? 'Dissociazione...'
+											: 'Dissocia'}
+									</button>
+								</div>
+							);
+						})
+					)}
 				</div>
 			</div>
 		</div>

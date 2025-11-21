@@ -1,5 +1,13 @@
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, restoreTag as apiRestoreTag } from "../services/backendClient";
+import {
+  getTags as apiGetTags,
+  createTag as apiCreateTag,
+  deleteTag as apiDeleteTag,
+  restoreTag as apiRestoreTag,
+  saveAssociation as apiSaveAssociation,
+  fetchTagAssociations,
+  deleteAssociation as apiDeleteAssociation,
+} from "../services/backendClient";
 import { LocalsenseClient } from "../services/localsenseClient";
 
 const DataContext = createContext(null);
@@ -42,7 +50,48 @@ export const DataProvider = ({ children }) => {
       await loadTags();
       return true;
     };
-  const [tagAssociations] = useState([]);
+  const [tagAssociations, setTagAssociations] = useState([]);
+
+  const loadTagAssociations = async (siteId) => {
+    const effectiveSiteId = siteId ?? currentSite?.id;
+    if (!effectiveSiteId) {
+      setTagAssociations([]);
+      return false;
+    }
+    try {
+      const rows = await fetchTagAssociations(effectiveSiteId);
+      setTagAssociations(Array.isArray(rows) ? rows : []);
+      return true;
+    } catch (error) {
+      console.warn('Impossibile caricare le associazioni dei tag', error);
+      setTagAssociations([]);
+      return false;
+    }
+  };
+
+  useEffect(() => {
+    loadTagAssociations();
+  }, [currentSite?.id]);
+
+  const associateTag = async (tagId, targetType, targetId) => {
+    const siteId = currentSite?.id;
+    if (!siteId) {
+      throw new Error('Nessun sito selezionato');
+    }
+    await apiSaveAssociation(tagId, targetType, targetId, siteId);
+    await loadTagAssociations(siteId);
+    return true;
+  };
+
+  const dissociateTag = async (tagId) => {
+    const siteId = currentSite?.id;
+    if (!siteId) {
+      throw new Error('Nessun sito selezionato');
+    }
+    await apiDeleteAssociation(siteId, tagId);
+    await loadTagAssociations(siteId);
+    return true;
+  };
 
   // Realtime
   const [positions, setPositions] = useState({});
@@ -288,6 +337,9 @@ export const DataProvider = ({ children }) => {
       assets,
       tags,
       tagAssociations,
+      associateTag,
+      dissociateTag,
+      reloadTagAssociations: loadTagAssociations,
       positions,
       isConnected,
   tagNames,
@@ -311,7 +363,7 @@ export const DataProvider = ({ children }) => {
       removeTag,
       restoreTag,
     }),
-    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, updateTagOverride, clearTagOverride, calibrationDirty, saveCalibration, loadCalibration, resetCalibration, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
+    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, associateTag, dissociateTag, loadTagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, updateTagOverride, clearTagOverride, calibrationDirty, saveCalibration, loadCalibration, resetCalibration, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
   );
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;

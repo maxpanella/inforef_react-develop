@@ -7,6 +7,7 @@ export const saveUsers = async (users) => {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				id: user.id,
+				companyId: user.companyId || env.companyId,
 				name: user.name,
 				role: user.role,
 				email: user.email || '',
@@ -46,6 +47,7 @@ export const saveAssets = async (assets) => {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				id: asset.id,
+				companyId: asset.companyId || env.companyId,
 				name: asset.name,
 				type: asset.type,
 				model: asset.model || '',
@@ -63,11 +65,21 @@ export const saveAssets = async (assets) => {
 };
 
 export const saveAssociation = async (tagId, targetType, targetId, siteId) => {
-	return fetch(`${env.backendUrl}/api/associate`, {
+	const resp = await fetch(`${env.backendUrl}/api/associate`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ tagId, targetType, targetId, siteId }),
 	});
+	if (!resp.ok) {
+		let message = '';
+		try {
+			message = await resp.text();
+		} catch (_) {}
+		throw new Error(
+			`Errore durante il salvataggio dell'associazione (status ${resp.status}): ${message}`
+		);
+	}
+	return resp.json();
 };
 
 export const fetchStoredUsers = async () => {
@@ -86,6 +98,36 @@ export const fetchStoredAssets = async () => {
 	}
 	const data = await res.json();
 	return Array.isArray(data) ? data : [];
+};
+
+export const fetchTagAssociations = async (siteId) => {
+	const resolvedSiteId = siteId ?? 'default';
+	const res = await fetch(`${env.backendUrl}/api/associations/${resolvedSiteId}`);
+	if (!res.ok) {
+		throw new Error('Errore caricamento associazioni tag');
+	}
+	const data = await res.json();
+	return Array.isArray(data) ? data : [];
+};
+
+export const deleteAssociation = async (siteId, tagId) => {
+	const resolvedSiteId = siteId ?? 'default';
+	const resp = await fetch(
+		`${env.backendUrl}/api/associate/${resolvedSiteId}/${encodeURIComponent(
+			tagId
+		)}`,
+		{ method: 'DELETE' }
+	);
+	if (!resp.ok) {
+		let text = '';
+		try {
+			text = await resp.text();
+		} catch (_) {}
+		throw new Error(
+			`Errore durante la rimozione dell'associazione (status ${resp.status}): ${text}`
+		);
+	}
+	return resp.json();
 };
 
 export const getTags = async () => {

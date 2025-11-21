@@ -214,7 +214,7 @@ app.get('/', (req, res) => res.send('BlueIOT backend running'));
 
 app.get('/api/sites', (req, res) => {
 	db.all(
-		`SELECT * FROM sites WHERE companyId = ?`,
+		`SELECT * FROM sites WHERE (companyId IS NULL OR companyId = ?)`,
 		[COMPANY_ID],
 		(err, rows) => {
 			if (err) return res.status(500).json({ error: 'DB error' });
@@ -556,60 +556,104 @@ app.post('/api/map-config', (req, res) => {
 	}
 });
 
-app.post('/api/associate', (req, res) => {
+	app.post('/api/associate', (req, res) => {
 	const { tagId, targetType, targetId, siteId } = req.body;
-
 	if (!tagId || !targetType || !targetId || !siteId) {
 		return res.status(400).json({ error: 'Missing required fields' });
 	}
-
-	// Verifica che il tipo di entità sia valido
 	if (targetType !== 'employee' && targetType !== 'asset') {
 		return res.status(400).json({ error: 'Invalid target type' });
 	}
 
-	// Verifica l'esistenza del tag
 	db.get('SELECT id FROM tags WHERE id = ?', [tagId], (err, tagRow) => {
 		if (err) return res.status(500).json({ error: 'Database error' });
 		if (!tagRow) {
-			// Il tag non esiste, lo creiamo con batteria sconosciuta
 			db.run('INSERT INTO tags (id, battery) VALUES (?, ?)', [tagId, -1]);
 		}
 
-		// Verifica che l'entità target esista nella tabella appropriata
-		const targetTable = targetType === 'employee' ? 'users' : 'assets';
-		db.get(
-			`SELECT id FROM ${targetTable} WHERE id = ? AND companyId = ?`,
-			[targetId, COMPANY_ID],
-			(err, targetRow) => {
-				if (err) return res.status(500).json({ error: 'Database error' });
-				if (!targetRow)
-					return res.status(404).json({ error: `${targetType} not found` });
-
-				// Salva l'associazione
+		const persistAssociation = () => {
+			const nowIso = new Date().toISOString();
+			db.serialize(() => {
+				db.run(
+					`UPDATE tag_assignments SET validTo = ? WHERE tagId = ? AND (siteId IS ? OR siteId = ?) AND (validTo IS NULL OR validTo > CURRENT_TIMESTAMP)`,
+					[nowIso, tagId, siteId || null, siteId || null]
+				);
+				db.run(
+					`INSERT INTO tag_assignments (tagId, targetType, targetId, siteId, validFrom, validTo) VALUES (?, ?, ?, ?, ?, NULL)`,
+					[tagId, targetType, targetId, siteId, nowIso]
+				);
 				db.run(
 					`REPLACE INTO associations (tagId, targetType, targetId, siteId) VALUES (?, ?, ?, ?)`,
 					[tagId, targetType, targetId, siteId],
-					(err) => {
-						if (err) return res.status(500).json({ error: 'Database error' });
-
-						// Registra l'azione nel log
+					(err2) => {
+						if (err2) return res.status(500).json({ error: 'Database error' });
 						db.run(
 							`INSERT INTO logs (type, message, siteId) VALUES (?, ?, ?)`,
-							[
-								'ASSOCIATION',
-								`Tag ${tagId} associated with ${targetType} ${targetId}`,
-								siteId,
-							]
+							['ASSOCIATION', `Tag ${tagId} associated with ${targetType} ${targetId}`, siteId]
 						);
-
 						res.json({ success: true });
 					}
 				);
+			});
+		};
+
+		const targetTable = targetType === 'employee' ? 'users' : 'assets';
+		db.get(
+			`SELECT id FROM ${targetTable} WHERE id = ? AND (companyId IS NULL OR companyId = ?)`,
+			[targetId, COMPANY_ID],
+			(err2, targetRow) => {
+				if (err2) return res.status(500).json({ error: 'Database error' });
+				if (!targetRow) {
+					console.warn(`Association warning: ${targetType} ${targetId} not found locally, proceeding anyway`);
+				}
+				persistAssociation();
 			}
 		);
 	});
 });
+
+app.delete('/api/associate/:siteId/:tagId', (req, res) => {
+
+	const { siteId, tagId } = req.params;
+
+	if (!siteId || !tagId) {
+
+		return res.status(400).json({ error: 'Missing siteId or tagId' });
+
+	}
+
+	db.run(
+
+		'DELETE FROM associations WHERE siteId = ? AND tagId = ?',
+
+		[siteId, tagId],
+
+		function (err) {
+
+			if (err) return res.status(500).json({ error: 'Database error' });
+
+			db.run(
+				`DELETE FROM tag_assignments WHERE tagId = ? AND (siteId IS ? OR siteId = ?)`,
+				[tagId, siteId || null, siteId || null]
+			);
+
+			db.run(
+
+				`INSERT INTO logs (type, message, siteId) VALUES (?, ?, ?)`,
+
+				['ASSOCIATION', `Tag ${tagId} dissociated`, siteId]
+
+			);
+
+			res.json({ success: true, removed: this.changes || 0 });
+
+		}
+
+	);
+
+});
+
+
 
 // Aggiungi anche un endpoint per ottenere le associazioni dei tag
 app.get('/api/associations/:siteId', (req, res) => {
