@@ -50,6 +50,8 @@ let posDiag = {
   lastFlags: null, // { isGlobal, isGeo }
 };
 let currentPosOutType = "XY";
+// Track already logged variant mismatches to avoid console spam
+const seenIdVariantPairs = new Set();
 
 function loadScriptOnce(src) {
   return new Promise((resolve, reject) => {
@@ -327,8 +329,12 @@ export const LocalsenseClient = {
                 if (hx && hx.length >= 8) {
                   const low32 = String(parseInt(hx.slice(-8), 16) >>> 0);
                   if (pid && pid !== low32) {
-                    pushEvent('idVariantMismatch', { src: 'json', id: pid, idHex: hx, low32, sample: p });
-                    dbg('[BlueIot][CHECK] id mismatch json:', pid, 'vs low32(hex)', low32);
+                    const key = pid + '|' + low32;
+                    if (!seenIdVariantPairs.has(key)) {
+                      seenIdVariantPairs.add(key);
+                      pushEvent('idVariantMismatch', { src: 'json', id: pid, idHex: hx, low32, sample: p });
+                      dbg('[BlueIot][CHECK] id mismatch json:', pid, 'vs low32(hex)', low32);
+                    }
                   }
                 }
               } catch(_) {}
@@ -338,13 +344,20 @@ export const LocalsenseClient = {
           try {
             arr.forEach(p => {
               try {
-                const preferred = p.idHex || p.id || p.tag_id || p.tagid;
-                const canon = canonicalizeId(preferred ?? p.id);
+                // Stable strategy: always use low32 decimal if hex present, else raw decimal.
+                let baseId;
+                const hx = p.idHex ? String(p.idHex).replace(/[^0-9A-Fa-f]/g, '').toUpperCase() : null;
+                if (hx && hx.length >= 8) {
+                  baseId = String(parseInt(hx.slice(-8), 16) >>> 0);
+                } else {
+                  baseId = String(p.id);
+                }
+                const canon = canonicalizeId(baseId);
                 if (canon) {
                   p.idRaw = String(p.id);
                   p.id = String(canon);
                 } else {
-                  p.id = String(p.id);
+                  p.id = baseId;
                 }
               } catch(_) { /* ignore per-entry */ }
             });

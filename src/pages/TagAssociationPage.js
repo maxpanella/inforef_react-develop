@@ -174,7 +174,7 @@ const TagAssociationPage = () => {
 						<option value=''>-- Seleziona Tag --</option>
 						{availableTags.map((tag) => (
 							<option key={tag.id} value={tag.id}>
-								{tag.id}
+								{tag.internalId ? `#${tag.internalId} ` : ''}{tag.id} {tag.name ? `— ${tag.name}` : ''}
 							</option>
 						))}
 					</select>

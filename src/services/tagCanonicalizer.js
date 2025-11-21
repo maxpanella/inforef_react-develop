@@ -56,21 +56,21 @@ export function canonicalizeId(rawId) {
   if (rawId === null || typeof rawId === 'undefined') return String(rawId);
   const s = String(rawId).trim();
   if (!s) return s;
-  // direct lookup
   if (variantToCanon.has(s)) return variantToCanon.get(s);
-  // try normalized hex
-  const hx = normHex(s);
-  if (hx) {
+  const hexLike = /[A-Fa-f]/.test(s) || s.startsWith('0x') || s.startsWith('0X') || /[-:]/.test(s);
+  if (hexLike) {
+    const hx = normHex(s);
     if (variantToCanon.has(hx)) return variantToCanon.get(hx);
-    // Prefer full normalized HEX as canonical when available (e.g., 12-byte like C5D566E015E5)
-    if (hx.length >= 8) return hx; // keep full hex, not just low32
+    if (hx.length >= 8) {
+      try {
+        const low32Dec = String(parseInt(hx.slice(-8), 16) >>> 0);
+        return variantToCanon.has(low32Dec) ? variantToCanon.get(low32Dec) : low32Dec;
+      } catch(_) { /* ignore */ }
+    }
+    return hx || s;
   }
-  // numeric fallback: return low32 decimal string
-  if (/^[0-9]+$/.test(s)) {
-    try { return String(Number(s) >>> 0); } catch(_) { return s; }
-  }
-  // last resort: uppercase hex-like
-  if (/[A-Fa-f]/.test(s)) return hx || s;
+  // Pure decimal: keep full (strip leading zeros only)
+  if (/^[0-9]+$/.test(s)) return s.replace(/^0+/, '') || '0';
   return s;
 }
 

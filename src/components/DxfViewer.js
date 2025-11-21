@@ -1,22 +1,25 @@
-/* eslint-disable react-hooks/exhaustive-deps */
+/* eslint-disable react-hooks/exhaustive-deps, no-unused-vars */
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import DxfParser from "dxf-parser";
 
-export function DxfViewer({
-  data,
-  width = "100%",
-  tagPositions = {},
-  debugRawPositions = {},
-  showTagsMessage = true,
-  anchors = [], 
-  onTagClick = null, 
-  onMapClick = null,
-  onNormalizationChange = null, 
-  focusPoint = null, 
-  onBoundsChange = null, 
-}) {
+export function DxfViewer(props) {
+  const {
+    data,
+    width = "100%",
+    tagPositions = {},
+    debugRawPositions = {},
+    showTagsMessage = true,
+    onTagClick = null,
+    onMapClick = null,
+    onNormalizationChange = null,
+    focusPoint = null,
+    onBoundsChange = null,
+    visualRotationDeg = 0,
+    areas = [],
+    referencePoints = [], // punti di calibrazione target {id,mapX,mapY}
+  } = props;
   const containerRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
@@ -33,6 +36,8 @@ export function DxfViewer({
   // Gruppo overlay per elementi della mappa (contorni) e fattore di normalizzazione
   const overlayRef = useRef(null);
   const normScaleRef = useRef(1);
+  const areasRef = useRef([]);
+  const refPointsGroupRef = useRef(null);
 
   // Rettangolo di delimitazione della mappa e riferimenti ai marker
   const mapBoundsRef = useRef({ min: { x: 0, y: 0 }, max: { x: 100, y: 100 } });
@@ -46,7 +51,7 @@ export function DxfViewer({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [hoverTagId, setHoverTagId] = useState(null);
-  const [exitNotice, setExitNotice] = useState(null);
+  const [exitNotice, setExitNotice] = useState(null); // eslint-disable-line no-unused-vars
   const markerPixelSize = 12; // diametro desiderato in pixel
 
   // Inizializza il renderer Three.js
@@ -55,20 +60,18 @@ export function DxfViewer({
     if (!containerEl) return;
 
     try {
-  const initialContainerEl = containerEl;
       setLoading(true);
       console.log("Inizializzazione DxfViewer");
 
-      // Ottieni le dimensioni del container
-  const width = containerEl.clientWidth;
-  const height = containerEl.clientHeight;
+        // Ottieni le dimensioni del container
+        const viewWidth = containerEl.clientWidth;
+        const viewHeight = containerEl.clientHeight;
 
       // Inizializza la scena Three.js
       const scene = new THREE.Scene();
       scene.background = new THREE.Color(0xf8f9fa);
       sceneRef.current = scene;
 
-      // Crea un gruppo per i tag e aggiungilo alla scena
       const tagsGroup = new THREE.Group();
       scene.add(tagsGroup);
       tagsRef.current = tagsGroup;
@@ -82,26 +85,21 @@ export function DxfViewer({
   const overlayGroup = new THREE.Group();
   scene.add(overlayGroup);
   overlayRef.current = overlayGroup;
+  // Gruppo per punti di riferimento calibrazione
+  const refPtsGroup = new THREE.Group();
+  overlayGroup.add(refPtsGroup);
+  refPointsGroupRef.current = refPtsGroup;
 
       // Inizializza la camera
-      const camera = new THREE.PerspectiveCamera(
-        45,
-        width / height,
-        0.1,
-        10000
-      );
+      const camera = new THREE.PerspectiveCamera(45, viewWidth / viewHeight, 0.1, 10000);
       camera.position.set(0, 0, 100);
       cameraRef.current = camera;
 
       // Inizializza il renderer con alta qualità
-        const renderer = new THREE.WebGLRenderer({
-          antialias: true,
-          alpha: true,
-          preserveDrawingBuffer: true,
-        });
-      renderer.setSize(width, height);
+      const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      renderer.setSize(viewWidth, viewHeight);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    containerEl.appendChild(renderer.domElement);
+      containerEl.appendChild(renderer.domElement);
       rendererRef.current = renderer;
 
       // Aggiungi controlli per navigazione
@@ -113,6 +111,8 @@ export function DxfViewer({
       controls.maxDistance = 5000;
       controls.maxPolarAngle = Math.PI / 2;
       controls.enableRotate = false; // Disabilita rotazione per planimetrie 2D
+      // Abilita pan con tasto sinistro per spostare la mappa
+      try { controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }; } catch(_) {}
       controlsRef.current = controls;
 
       // Funzione salvataggio camera
@@ -241,8 +241,26 @@ export function DxfViewer({
           const hit = new THREE.Vector3();
           if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
             const ns = normScaleRef.current || 1;
-            // ritorna coordinate mappa raw (prima della normalizzazione)
-            const pt = { x: hit.x / ns, y: hit.y / ns };
+            const rad = (visualRotationDeg || 0) * Math.PI / 180;
+            // Inverse rotation (unrotate) around origin, then remove normalization scale.
+            const cos = Math.cos(rad), sin = Math.sin(rad);
+            const unrotX =  cos * hit.x + sin * hit.y;
+            const unrotY = -sin * hit.x + cos * hit.y;
+            const rawOriginalX = unrotX / ns;
+            const rawOriginalY = unrotY / ns;
+            // Coordinates as presently displayed (already rotated & scaled)
+            const displayX = hit.x;
+            const displayY = hit.y;
+            const pt = {
+              x: rawOriginalX, // prefer raw (pre-scale, pre-rotation) for calibration
+              y: rawOriginalY,
+              rawOriginalX,
+              rawOriginalY,
+              displayX,
+              displayY,
+              normScale: ns,
+              rotDeg: visualRotationDeg || 0,
+            };
             try { window.__DXF_LAST_CLICK = pt; } catch(_) {}
             if (onMapClick) { try { onMapClick(pt); } catch(_) {} }
           }
@@ -271,9 +289,10 @@ export function DxfViewer({
           cancelAnimationFrame(animationFrameRef.current);
         }
 
-        if (rendererRef.current && initialContainerEl) {
-          if (initialContainerEl.contains(rendererRef.current.domElement)) {
-            initialContainerEl.removeChild(rendererRef.current.domElement);
+        const cleanupEl = containerRef.current;
+        if (rendererRef.current && cleanupEl) {
+          if (cleanupEl.contains(rendererRef.current.domElement)) {
+            cleanupEl.removeChild(rendererRef.current.domElement);
           }
           rendererRef.current.dispose();
         }
@@ -306,6 +325,48 @@ export function DxfViewer({
 
   // Conversione coordinate mappa -> mondo (qui identità perché il gruppo tag viene scalato come la mappa)
   const toWorld = (x, y) => ({ x, y });
+
+  // Aggiorna visualizzazione punti di riferimento calibrazione (croci + label piccola)
+  useEffect(() => {
+    if (!refPointsGroupRef.current) return;
+    const g = refPointsGroupRef.current;
+    // Pulisci precedenti
+    while (g.children.length) { const ch = g.children.pop(); if (ch.geometry) ch.geometry.dispose(); if (ch.material) ch.material.dispose(); }
+    if (!Array.isArray(referencePoints) || referencePoints.length === 0) return;
+    const size = 8; // lunghezza bracci croce
+    referencePoints.forEach((pt) => {
+      if (!pt || !isFinite(pt.mapX) || !isFinite(pt.mapY)) return;
+      const x = pt.mapX; const y = pt.mapY;
+      const geom = new THREE.BufferGeometry();
+      const verts = new Float32Array([
+        x - size, y, 0, x + size, y, 0, // orizzontale
+        x, y - size, 0, x, y + size, 0  // verticale
+      ]);
+      geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+      const mat = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 1 });
+      const lines = new THREE.LineSegments(geom, mat);
+      lines.renderOrder = 9999;
+      g.add(lines);
+      // Etichetta
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 32;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillRect(0,0,128,32);
+      ctx.fillStyle = '#d00';
+      ctx.font = '12px sans-serif';
+      ctx.textBaseline = 'middle';
+      const label = (pt.id||'ref');
+      ctx.fillText(label, 4, 16);
+      const tex = new THREE.CanvasTexture(canvas);
+      const sprMat = new THREE.SpriteMaterial({ map: tex, depthTest:false, depthWrite:false });
+      const sprite = new THREE.Sprite(sprMat);
+      sprite.position.set(x + size + 2, y + size + 2, 0);
+      sprite.scale.set(40, 10, 1);
+      sprite.renderOrder = 10000;
+      g.add(sprite);
+    });
+  }, [referencePoints, visualRotationDeg]);
 
   // Aggiorna i tag sulla mappa quando le posizioni cambiano
   useEffect(() => {
@@ -371,13 +432,26 @@ export function DxfViewer({
           return;
         }
 
-  // Marker più piccoli (richiesta utente)
-  const markerSize = 2; // raggio base
-
-  // Crea un nuovo marker usando forme 3D semplici invece di texture
-  const markerGeometry = new THREE.CylinderGeometry(markerSize, markerSize, 0.8, 20);
-  const markerMaterial = new THREE.MeshBasicMaterial({ color: color });
-        const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+  // Dimensioni ridotte e differenziazione forma tra employee e asset
+  const isEmployee = info.type === 'employee';
+  const markerSize = isEmployee ? 1.4 : 1.8; // raggio (employee più piccolo)
+  let marker;
+  if (isEmployee) {
+    // Cilindro piatto per dipendenti
+    const geom = new THREE.CylinderGeometry(markerSize, markerSize, 0.7, 24);
+    const mat = new THREE.MeshBasicMaterial({ color: color, depthTest: false, depthWrite: false });
+    marker = new THREE.Mesh(geom, mat);
+  } else {
+    // Diamante (box ruotato) per asset
+    const side = markerSize * 2.2;
+    const geom = new THREE.BoxGeometry(side, side, 0.6);
+    const mat = new THREE.MeshBasicMaterial({ color: color, depthTest: false, depthWrite: false });
+    marker = new THREE.Mesh(geom, mat);
+    marker.rotation.z = Math.PI / 4; // ruota per ottenere forma a diamante
+  }
+  // Aumenta renderOrder per stare sopra overlay/reference points
+  marker.renderOrder = 20000;
+  marker.frustumCulled = false;
 
         // Posiziona il marker e assicurati che sia visibile sopra la mappa
   marker.position.set(world.x, world.y, 10); // Posizionato più in alto per visibilità
@@ -386,20 +460,25 @@ export function DxfViewer({
 
         // Aggiungi un bordo bianco più spesso per maggiore visibilità
   // Bordi più discreti: cerchio sottile
-  const ringGeometry = new THREE.TorusGeometry(markerSize + 0.7, 0.4, 8, 24);
-  const ringMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
-  const ring = new THREE.Mesh(ringGeometry, ringMaterial);
-  ring.rotation.x = Math.PI / 2;
-  marker.add(ring);
+  if (isEmployee) {
+    // Solo per dipendenti: bordo sottile
+    const ringGeometry = new THREE.TorusGeometry(markerSize + 0.5, 0.35, 6, 20);
+    const ringMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false });
+    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+    ring.rotation.x = Math.PI / 2;
+    ring.renderOrder = 20001;
+    marker.add(ring);
+  }
 
         // Amplia l'area di click con un "hit area" trasparente (solo per raycast)
         try {
           const hitSize = markerSize * 4; // area di click più grande della grafica
           const hitGeo = new THREE.CylinderGeometry(hitSize, hitSize, 1, 16);
-          const hitMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.001, depthWrite: false });
+          const hitMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: 0.001, depthWrite: false, depthTest: false });
           const hitMesh = new THREE.Mesh(hitGeo, hitMat);
           hitMesh.rotation.x = Math.PI / 2;
           hitMesh.userData = { tagId, isHit: true };
+          hitMesh.renderOrder = 20002;
           marker.add(hitMesh);
         } catch(_) {}
 
@@ -722,6 +801,11 @@ export function DxfViewer({
 
         sceneRef.current.add(group);
         console.log(`Caricate ${entitiesCount} entità dalla mappa DXF`);
+        // Applica rotazione visuale iniziale se richiesta
+        try {
+          const rad = (visualRotationDeg || 0) * Math.PI / 180;
+          group.rotation.z = rad;
+        } catch(_) {}
 
         // Aggiorna i confini della mappa
         updateMapBounds(boundingBox);
@@ -798,6 +882,62 @@ export function DxfViewer({
       setLoading(false);
     }
   }, [data]);
+
+  // Aggiorna rotazione visuale mappa + overlay + gruppi tag quando cambia visualRotationDeg
+  useEffect(() => {
+    const rad = (visualRotationDeg || 0) * Math.PI / 180;
+    try {
+      if (tagsRef.current) tagsRef.current.rotation.z = rad;
+      if (anchorsRef.current) anchorsRef.current.rotation.z = rad;
+      if (overlayRef.current) overlayRef.current.rotation.z = rad;
+      if (sceneRef.current) {
+        sceneRef.current.traverse(obj => {
+          if (obj.userData && obj.userData.isDxf && obj.type === 'Group') {
+            obj.rotation.z = rad;
+          }
+        });
+      }
+    } catch(_) {}
+  }, [visualRotationDeg]);
+
+  // Disegna aree logiche sul layer overlay
+  useEffect(() => {
+    areasRef.current = Array.isArray(areas) ? areas : [];
+    if (!overlayRef.current) return;
+    try {
+      // Rimuovi vecchie aree
+      const toRemove = [];
+      overlayRef.current.traverse(o => { if (o.userData && o.userData.isAreaPolygon) toRemove.push(o); });
+      toRemove.forEach(o => overlayRef.current.remove(o));
+      // Aggiungi nuove
+      areasRef.current.forEach(a => {
+        if (!Array.isArray(a.polygon) || a.polygon.length < 3) return;
+        const shape = new THREE.Shape(a.polygon.map(p => new THREE.Vector2(p[0]*normScaleRef.current, p[1]*normScaleRef.current)));
+        const geo = new THREE.ShapeGeometry(shape);
+        const mat = new THREE.MeshBasicMaterial({ color: a.color || '#f59e0b', opacity: 0.25, transparent: true, depthWrite:false, depthTest:false });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.z = 2;
+        mesh.userData = { isAreaPolygon: true, areaId: a.id };
+        overlayRef.current.add(mesh);
+        // Label semplice
+        const canvas = document.createElement('canvas');
+        canvas.width = 256; canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,256,64);
+        ctx.fillStyle = '#fff'; ctx.font = '28px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(a.label || a.id,128,32);
+        const tex = new THREE.CanvasTexture(canvas);
+        const smat = new THREE.SpriteMaterial({ map: tex, depthTest:false, depthWrite:false });
+        const sprite = new THREE.Sprite(smat);
+        sprite.scale.set(40,10,1);
+        // Centroid
+        let cx=0, cy=0; a.polygon.forEach(p=> { cx+=p[0]; cy+=p[1]; }); cx/=a.polygon.length; cy/=a.polygon.length;
+        sprite.position.set(cx*normScaleRef.current, cy*normScaleRef.current, 4);
+        sprite.userData = { isAreaPolygon: true };
+        overlayRef.current.add(sprite);
+      });
+    } catch(_) {}
+  }, [areas]);
 
   // Funzione per aggiornare i confini della mappa
   const updateMapBounds = (boundingBox) => {
@@ -1971,6 +2111,12 @@ export function DxfViewer({
               title="Recenter"
             >Recenter</button>
           </div>
+        </div>
+      )}
+      {/* Exit / recovery notice */}
+      {exitNotice && (
+        <div className="absolute top-2 right-2 bg-yellow-200 border border-yellow-400 text-yellow-900 px-3 py-2 rounded shadow z-50 text-xs max-w-[240px]">
+          {exitNotice}
         </div>
       )}
     </div>

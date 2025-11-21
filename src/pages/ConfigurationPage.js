@@ -501,7 +501,7 @@ const ConfigurationPage = () => {
 					<div className='bg-white border rounded p-4 space-y-3'>
 						{tags.map((tag) => (
 							<div key={tag.id} className='border rounded p-3 bg-gray-50'>
-								<div className='font-medium mb-2'>Tag: {tag.id}</div>
+								<div className='font-medium mb-2'>Tag: {tag.internalId ? `#${tag.internalId} ` : ''}{tag.id} {tag.name ? `— ${tag.name}` : ''}</div>
 								<div className='grid grid-cols-2 gap-2'>
 									<select
 										onChange={(e) => {

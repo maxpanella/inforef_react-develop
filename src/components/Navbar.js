@@ -61,6 +61,9 @@ const Navbar = () => {
 							<Link to='/assets' className={linkStyle('/assets')}>
 								Macchinari
 							</Link>
+							<Link to='/areas' className={linkStyle('/areas')}>
+								Aree
+							</Link>
 							<button
 								onClick={logout}
 								className='ml-4 bg-red-600 hover:bg-red-700 transition text-white px-3 py-2 rounded-md text-sm font-medium'
