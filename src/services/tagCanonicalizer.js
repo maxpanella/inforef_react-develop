@@ -56,30 +56,21 @@ export function canonicalizeId(rawId) {
   if (rawId === null || typeof rawId === 'undefined') return String(rawId);
   const s = String(rawId).trim();
   if (!s) return s;
-  // direct lookup
   if (variantToCanon.has(s)) return variantToCanon.get(s);
-  // try normalized hex
-  const hx = normHex(s);
-  if (hx) {
+  const hexLike = /[A-Fa-f]/.test(s) || s.startsWith('0x') || s.startsWith('0X') || /[-:]/.test(s);
+  if (hexLike) {
+    const hx = normHex(s);
     if (variantToCanon.has(hx)) return variantToCanon.get(hx);
-    // Nuova strategia: per uniformare ID tra posizioni e nomi, preferisci sempre il low32 decimale
     if (hx.length >= 8) {
       try {
         const low32Dec = String(parseInt(hx.slice(-8), 16) >>> 0);
-        // Se abbiamo già una mappatura per low32 dec, restituiscila; altrimenti usa direttamente low32 dec
         return variantToCanon.has(low32Dec) ? variantToCanon.get(low32Dec) : low32Dec;
-      } catch(_) {
-        // fallback: se parsing fallisce, torna hex
-        return hx;
-      }
+      } catch(_) { /* ignore */ }
     }
+    return hx || s;
   }
-  // numeric fallback: return low32 decimal string
-  if (/^[0-9]+$/.test(s)) {
-    try { return String(Number(s) >>> 0); } catch(_) { return s; }
-  }
-  // last resort: uppercase hex-like
-  if (/[A-Fa-f]/.test(s)) return hx || s;
+  // Pure decimal: keep full (strip leading zeros only)
+  if (/^[0-9]+$/.test(s)) return s.replace(/^0+/, '') || '0';
   return s;
 }
 

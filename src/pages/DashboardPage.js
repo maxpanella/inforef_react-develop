@@ -34,6 +34,7 @@ const DashboardPage = () => {
     loadCalibration,
     resetCalibration,
     reloadTags,
+    syncDbNames,
     createTag,
     removeTag,
     restoreTag,
@@ -1798,10 +1799,11 @@ EOF`;
 
         {/* Anagrafica TAG (tutti, inclusi offline) */}
         <div className="lg:col-span-1 bg-white p-4 rounded shadow mt-6 lg:mt-0">
-          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-medium">Anagrafica TAG</h2>
             <div className="flex items-center gap-2">
               <button onClick={() => reloadTags()} className="px-2 py-1 text-xs rounded bg-gray-200 hover:bg-gray-300">Aggiorna</button>
+              <button onClick={() => syncDbNames()} className="px-2 py-1 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500" title="Forza sincronizzazione nomi dal DB">Sync Nomi DB</button>
             </div>
           </div>
           {(() => {
@@ -1825,7 +1827,7 @@ EOF`;
           </div>
           <div className="anagrafica-wrapper" data-only-offline="0">
             <ul className="divide-y divide-gray-200 max-h-80 overflow-auto">
-              {(tags || []).map((t) => {
+                {(tags || []).map((t) => {
                 const canon = canonicalizeId(t.id);
                 const isOnline = (() => {
                   if (Object.prototype.hasOwnProperty.call(enhancedPositions, canon)) return true;
@@ -1843,7 +1845,8 @@ EOF`;
                       style={{ display: (function(){ try { const wrap = document.querySelector('.anagrafica-wrapper'); const only = wrap && wrap.dataset.onlyOffline==='1'; return (only && isOnline) ? 'none' : ''; } catch(_) { return ''; } })() }}>
                     <div className="flex items-center gap-2">
                             <span className={`inline-block w-2 h-2 rounded-full ${isDecommissioned ? 'bg-rose-400' : (isOnline? 'bg-emerald-500':'bg-gray-400')}`}></span>
-                            <span className="font-mono text-[12px]">{canon}</span>
+                            <span className="font-mono text-[12px]">{t.internalId ? `#${t.internalId}` : ''} {canon}</span>
+                            {t.name ? <span className="ml-2 text-sm font-medium">{t.name}</span> : <span className="ml-2 text-[11px] text-gray-500">(no name)</span>}
                             {(() => {
                               try {
                                 // Compute hex full and low32 variants for display
@@ -1874,7 +1877,7 @@ EOF`;
                                 title="Ripristina TAG">Ripristina</button>
                       ) : (
                         <button className="px-2 py-0.5 text-[11px] rounded bg-rose-600 text-white hover:bg-rose-500"
-                                onClick={() => handleRemoveSpecificTag(t.id)}
+                                onClick={() => handleRemoveSpecificTag(t.internalId ? String(t.internalId) : t.id)}
                                 title="Rimuovi TAG">Rimuovi</button>
                       )}
                     </div>

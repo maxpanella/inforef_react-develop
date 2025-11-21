@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { canonicalizeId } from "../services/tagCanonicalizer";
-import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, restoreTag as apiRestoreTag } from "../services/backendClient";
+import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, deleteTagByInternalId as apiDeleteByInternalId, restoreTag as apiRestoreTag } from "../services/backendClient";
 import { LocalsenseClient } from "../services/localsenseClient";
 
 const DataContext = createContext(null);
@@ -21,9 +21,41 @@ export const DataProvider = ({ children }) => {
     const loadTags = async () => {
       try {
         const list = await apiGetTags();
-        setTags(Array.isArray(list) ? list : []);
+        const tagsList = Array.isArray(list) ? list : [];
+        setTags(tagsList);
+        // Merge DB-stored names into runtime tagNames so live views show the DB name
+        try {
+          const mapping = {};
+          tagsList.forEach(t => {
+            if (t && t.id && t.name) {
+              try { mapping[canonicalizeId(t.id)] = t.name; } catch(_) { mapping[String(t.id)] = t.name; }
+            }
+          });
+          if (Object.keys(mapping).length) {
+            setTagNames(prev => {
+              const merged = { ...prev, ...mapping };
+              try { localStorage.setItem('blueiot_tag_names', JSON.stringify(merged)); } catch(_) {}
+              return merged;
+            });
+          }
+        } catch(_) {}
       } catch (_) {
         setTags([]);
+      }
+    };
+
+    const syncDbNames = async () => {
+      // Force reload and overwrite tagNames strictly with DB names
+      try {
+        const list = await apiGetTags();
+        const tagsList = Array.isArray(list) ? list : [];
+        setTags(tagsList);
+        const mapping = {};
+        tagsList.forEach(t => { if (t && t.id && t.name) { mapping[canonicalizeId(t.id)] = t.name; } });
+        setTagNames(mapping);
+        try { localStorage.setItem('blueiot_tag_names', JSON.stringify(mapping)); } catch(_) {}
+      } catch(e) {
+        console.error('Sync DB names failed', e);
       }
     };
     useEffect(() => { loadTags(); }, []);
@@ -35,9 +67,35 @@ export const DataProvider = ({ children }) => {
     };
 
     const removeTag = async (id) => {
-      const res = await apiDeleteTag(String(id));
-      await loadTags();
-      return res;
+      // Prefer deletion by internalId (stable) when possible.
+      // id may be: internalId (number or numeric string) OR canonical tag id string.
+      try {
+        const maybeNum = Number(id);
+        // If it's an integer, try lookup by internalId first
+        if (Number.isInteger(maybeNum) && maybeNum > 0) {
+          const byInternal = tags.find(t => Number(t.internalId) === maybeNum);
+          if (byInternal) {
+            const res = await apiDeleteByInternalId(maybeNum);
+            await loadTags();
+            return res;
+          }
+        }
+        // Otherwise, try to find the tag object by its stored id and delete by its internalId
+        const found = tags.find(t => String(t.id) === String(id));
+        if (found && found.internalId) {
+          const res = await apiDeleteByInternalId(Number(found.internalId));
+          await loadTags();
+          return res;
+        }
+        // Fallback to existing behavior (server will canonicalize)
+        const res = await apiDeleteTag(String(id));
+        await loadTags();
+        return res;
+      } catch (e) {
+        // On error, still try to refresh tags
+        try { await loadTags(); } catch(_) {}
+        throw e;
+      }
     };
     const restoreTag = async (id) => {
       await apiRestoreTag(String(id));
@@ -530,11 +588,12 @@ export const DataProvider = ({ children }) => {
       videoTrack,
       // tag registry ops
       reloadTags: loadTags,
+      syncDbNames,
       createTag,
       removeTag,
       restoreTag,
     }),
-    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, updateTagOverride, clearTagOverride, calibrationDirty, saveCalibration, loadCalibration, resetCalibration, getDiagnostics, clearDiagnostics, setDiagnosticsPaused, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, createTag, removeTag, restoreTag]
+    [sites, currentSite, selectSite, employees, assets, tags, tagAssociations, positions, isConnected, tagNames, calibration, updateCalibration, updateTagOverride, clearTagOverride, calibrationDirty, saveCalibration, loadCalibration, resetCalibration, getDiagnostics, clearDiagnostics, setDiagnosticsPaused, lastTag, lastRawFrame, vibrateTag, lastVibrateAck, videoTrack, loadTags, syncDbNames, createTag, removeTag, restoreTag]
   );
 
   return <DataContext.Provider value={value}>{children}</DataContext.Provider>;

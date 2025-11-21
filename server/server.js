@@ -199,6 +199,23 @@ db.serialize(() => {
 			if (!hasDecom) {
 				try { db.run(`ALTER TABLE tags ADD COLUMN decommissionedAt DATETIME`); } catch(_) {}
 			}
+			// internalId progressivo (non PK) per avere un identificatore certo nelle viste UI
+			const hasInternal = Array.isArray(rows) && rows.some(c => String(c.name).toLowerCase() === 'internalid');
+			if (!hasInternal) {
+				try { db.run(`ALTER TABLE tags ADD COLUMN internalId INTEGER`); } catch(_) {}
+				// Assegna valori progressivi agli esistenti se mancanti
+				db.get(`SELECT MAX(internalId) AS m FROM tags`, [], (eM, rM) => {
+					const base = (rM && Number(rM.m)) ? Number(rM.m) : 0;
+					db.all(`SELECT id FROM tags WHERE internalId IS NULL OR internalId = 0 ORDER BY id ASC`, [], (eR, rRows) => {
+						if (eR || !Array.isArray(rRows)) return;
+						let counter = base;
+						rRows.forEach(r => {
+							counter += 1;
+							db.run(`UPDATE tags SET internalId = ? WHERE id = ?`, [counter, r.id]);
+						});
+					});
+				});
+			}
 			// Extended schema columns required for richer tag telemetry & naming
 			const neededCols = [
 				{ name: 'name', ddl: 'ALTER TABLE tags ADD COLUMN name TEXT' },
@@ -448,47 +465,38 @@ app.get('/api/map-config/:siteId', (req, res) => {
 });
 
 // Simple Tag Registry endpoints
+// Helper: canonicalize external tag id (stable form stored in DB)
+function canonicalizeTagId(raw) {
+	if (raw === null || typeof raw === 'undefined') return '';
+	const s = String(raw).trim();
+	if (!s) return s;
+	// Determine if hex-like: contains any A-F letter or explicit hex prefix/separators
+	const hexLike = /[A-Fa-f]/.test(s) || s.startsWith('0x') || s.startsWith('0X') || /[-:]/.test(s);
+	if (hexLike) {
+		const hx = s.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+		if (hx.length >= 8) {
+			try { return String(parseInt(hx.slice(-8), 16) >>> 0); } catch(_) { /* fallback below */ }
+		}
+		return hx || s;
+	}
+	// Pure decimal: keep full string (remove leading zeros only)
+	if (/^[0-9]+$/.test(s)) {
+		const trimmed = s.replace(/^0+/, '') || '0';
+		return trimmed;
+	}
+	return s;
+}
+
 app.get('/api/tags', (req, res) => {
-	// Non includiamo coordinate per non duplicare lo storage di tracking BlueIOT
-	db.all(`SELECT id, battery, name, lastSeen, status, decommissionedAt FROM tags ORDER BY id ASC`, [], (err, rows) => {
+	const includeDeleted = req.query.includeDeleted === '1' || req.query.includeDeleted === 'true';
+	const sql = includeDeleted
+		? `SELECT id, internalId, battery, name, lastSeen, status, decommissionedAt FROM tags ORDER BY internalId ASC, id ASC`
+		: `SELECT id, internalId, battery, name, lastSeen, status, decommissionedAt FROM tags WHERE decommissionedAt IS NULL ORDER BY internalId ASC, id ASC`;
+	db.all(sql, [], (err, rows) => {
 		if (err) return res.status(500).json({ error: 'DB error' });
 		res.json(rows || []);
 	});
 });
-
-
-// Helper: normalize and generate ID variants to match stored forms (hex/dec/raw)
-function buildIdVariants(inputId) {
-	const out = new Set();
-	if (inputId === null || typeof inputId === 'undefined') return Array.from(out);
-	try {
-		const s = String(inputId).trim();
-		if (!s) return Array.from(out);
-		out.add(s);
-		const hx = s.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
-		if (hx) {
-			out.add(hx);
-			out.add('0x' + hx);
-			if (hx.length >= 8) {
-				try {
-					const low32 = String((parseInt(hx.slice(-8), 16) >>> 0));
-					out.add(low32);
-				} catch (_) {}
-			}
-		}
-		if (/^[0-9]+$/.test(s)) {
-			try {
-				const n = (Number(s) >>> 0);
-				const dec = String(n);
-				const h8 = n.toString(16).toUpperCase().padStart(8, '0');
-				out.add(dec);
-				out.add(h8);
-				out.add('0x' + h8);
-			} catch (_) {}
-		}
-	} catch (_) {}
-	return Array.from(out);
-}
 
 
 app.post('/api/tags', (req, res) => {
@@ -496,8 +504,7 @@ app.post('/api/tags', (req, res) => {
 	if (id === null || typeof id === 'undefined') {
 		return res.status(400).json({ error: 'Missing tag id' });
 	}
-	// Coerce to trimmed string to accept numeric IDs
-	id = String(id).trim();
+	id = canonicalizeTagId(id);
 	if (!id) {
 		return res.status(400).json({ error: 'Invalid tag id' });
 	}
@@ -524,38 +531,44 @@ app.post('/api/tags', (req, res) => {
 });
 
 app.delete('/api/tags/:id', (req, res) => {
-	const reqId = req.params.id;
-	if (!reqId) return res.status(400).json({ error: 'Missing tag id' });
-	const variants = buildIdVariants(reqId);
-	console.log('[DELETE /api/tags/:id] requested', reqId, 'variants=', variants);
-	// Resolve the actual stored id using variants
-	const placeholders = variants.map(() => '?').join(',');
-	db.get(`SELECT id FROM tags WHERE id IN (${placeholders}) LIMIT 1`, variants, (err0, row0) => {
-		if (err0) return res.status(500).json({ error: 'DB error' });
-		const id = row0 ? row0.id : reqId; // fallback to requested
+	let id = req.params.id;
+	if (!id) return res.status(400).json({ error: 'Missing tag id' });
+	id = canonicalizeTagId(id);
+	console.log('[DELETE /api/tags/:id] canonical request', id);
+	db.get(`SELECT id FROM tags WHERE id = ? LIMIT 1`, [id], (eR, rR) => {
+		if (eR) return res.status(500).json({ error: 'DB error' });
+		if (!rR) {
+			// Diagnostics when no direct match found
+			db.all(`SELECT id, internalId, length(id) AS len FROM tags ORDER BY internalId ASC LIMIT 30`, [], (eAll, rows) => {
+				if (!eAll) {
+					console.log('[DELETE diagnostics] listing first30 ids', rows.map(r => ({ id: r.id, internalId: r.internalId, len: r.len })));
+				}
+				return res.json({ success: true, removed: 0, soft: false, matchedId: null, diagnostic: { requested: id } });
+			});
+			return;
+		}
+		const realId = rR.id;
 		db.serialize(() => {
-			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [realId], (errA, rowA) => {
 				if (errA) return res.status(500).json({ error: 'DB error' });
-				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [realId], (errP, rowP) => {
 					if (errP) return res.status(500).json({ error: 'DB error' });
-					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [realId], (errS, rowS) => {
 						if (errS) return res.status(500).json({ error: 'DB error' });
 						const hasHistory = !!(rowA || rowP || rowS);
 						if (!hasHistory) {
-							// Hard delete - remove dependent records and the tag itself
-							db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tags WHERE id = ?`, [realId], function(errDel) {
 								if (errDel) return res.status(500).json({ error: 'DB error' });
-								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: id });
+								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: realId });
 							});
 						} else {
-							// Soft delete - mark decommissioned and clear current association snapshot
-							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [realId], (errU) => {
 								if (errU) return res.status(500).json({ error: 'DB error' });
-								db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
-									return res.json({ success: true, removed: 0, soft: true, matchedId: id });
+								db.run(`DELETE FROM associations WHERE tagId = ?`, [realId], () => {
+									return res.json({ success: true, removed: 0, soft: true, matchedId: realId });
 								});
 							});
 						}
@@ -568,35 +581,35 @@ app.delete('/api/tags/:id', (req, res) => {
 
 // Fallback for environments where DELETE might be blocked: POST /api/tags/:id/delete
 app.post('/api/tags/:id/delete', (req, res) => {
-	const reqId = req.params.id;
-	if (!reqId) return res.status(400).json({ error: 'Missing tag id' });
-	const variants = buildIdVariants(reqId);
-	console.log('[POST /api/tags/:id/delete] requested', reqId, 'variants=', variants);
-	const placeholders = variants.map(() => '?').join(',');
-	db.get(`SELECT id FROM tags WHERE id IN (${placeholders}) LIMIT 1`, variants, (err0, row0) => {
-		if (err0) return res.status(500).json({ error: 'DB error' });
-		const id = row0 ? row0.id : reqId;
+	let id = req.params.id;
+	if (!id) return res.status(400).json({ error: 'Missing tag id' });
+	id = canonicalizeTagId(id);
+	console.log('[POST /api/tags/:id/delete] canonical request', id);
+	db.get(`SELECT id FROM tags WHERE id = ? LIMIT 1`, [id], (eR, rR) => {
+		if (eR) return res.status(500).json({ error: 'DB error' });
+		if (!rR) return res.json({ success: true, removed: 0, soft: false, matchedId: null });
+		const realId = rR.id;
 		db.serialize(() => {
-			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [realId], (errA, rowA) => {
 				if (errA) return res.status(500).json({ error: 'DB error' });
-				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [realId], (errP, rowP) => {
 					if (errP) return res.status(500).json({ error: 'DB error' });
-					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [realId], (errS, rowS) => {
 						if (errS) return res.status(500).json({ error: 'DB error' });
 						const hasHistory = !!(rowA || rowP || rowS);
 						if (!hasHistory) {
-							db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
-							db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tags WHERE id = ?`, [realId], function(errDel) {
 								if (errDel) return res.status(500).json({ error: 'DB error' });
-								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: id });
+								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: realId });
 							});
 						} else {
-							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [realId], (errU) => {
 								if (errU) return res.status(500).json({ error: 'DB error' });
-								db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
-									return res.json({ success: true, removed: 0, soft: true, matchedId: id });
+								db.run(`DELETE FROM associations WHERE tagId = ?`, [realId], () => {
+									return res.json({ success: true, removed: 0, soft: true, matchedId: realId });
 								});
 							});
 						}
@@ -614,6 +627,74 @@ app.post('/api/tags/:id/restore', (req, res) => {
 		if (err) return res.status(500).json({ error: 'DB error' });
 		res.json({ success: true, restored: this.changes || 0 });
 	});
+});
+
+// Delete by internalId (progressive key)
+app.delete('/api/tags/internal/:internalId', (req, res) => {
+	const internalId = Number(req.params.internalId);
+	if (!Number.isFinite(internalId) || internalId <= 0) {
+		return res.status(400).json({ error: 'Invalid internalId' });
+	}
+	console.log('[DELETE /api/tags/internal/:internalId] request', internalId);
+	db.get(`SELECT id FROM tags WHERE internalId = ? LIMIT 1`, [internalId], (err, row) => {
+		if (err) return res.status(500).json({ error: 'DB error' });
+		if (!row) return res.json({ success: true, removed: 0, soft: false, matchedId: null, internalId });
+		const realId = row.id;
+		db.serialize(() => {
+			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [realId], (errA, rowA) => {
+				if (errA) return res.status(500).json({ error: 'DB error' });
+				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [realId], (errP, rowP) => {
+					if (errP) return res.status(500).json({ error: 'DB error' });
+					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [realId], (errS, rowS) => {
+						if (errS) return res.status(500).json({ error: 'DB error' });
+						const hasHistory = !!(rowA || rowP || rowS);
+						if (!hasHistory) {
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [realId]);
+							db.run(`DELETE FROM tags WHERE internalId = ?`, [internalId], function(errDel) {
+								if (errDel) return res.status(500).json({ error: 'DB error' });
+								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: realId, internalId });
+							});
+						} else {
+							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE internalId = ?`, [internalId], (errU) => {
+								if (errU) return res.status(500).json({ error: 'DB error' });
+								db.run(`DELETE FROM associations WHERE tagId = ?`, [realId], () => {
+									return res.json({ success: true, removed: 0, soft: true, matchedId: realId, internalId });
+								});
+							});
+						}
+					});
+				});
+			});
+		});
+	});
+});
+
+// Full reset of all tag related data. Requires confirm token "ERASE".
+app.post('/api/tags/reset', (req, res) => {
+	const confirmToken = (req.query.confirm || (req.body && req.body.confirm) || '').toString();
+	if (confirmToken !== 'ERASE') {
+		return res.status(400).json({ ok: false, error: 'Missing confirm token. Use ?confirm=ERASE or body {"confirm":"ERASE"}' });
+	}
+	const tables = ['associations', 'tag_assignments', 'tag_positions', 'tag_power', 'tags'];
+	const results = [];
+	let idx = 0;
+	function runNext() {
+		if (idx >= tables.length) {
+			return res.json({ ok: true, results });
+		}
+		const tbl = tables[idx++];
+		db.run(`DELETE FROM ${tbl}`, function(err) {
+			if (err) {
+				results.push({ table: tbl, deleted: 0, error: err.message });
+			} else {
+				results.push({ table: tbl, deleted: this.changes || 0 });
+			}
+			runNext();
+		});
+	}
+	runNext();
 });
 
 app.post('/api/map-config', (req, res) => {

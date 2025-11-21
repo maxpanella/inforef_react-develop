@@ -168,6 +168,16 @@ export const deleteTag = async (id) => {
 	return resp.json();
 };
 
+export const deleteTagByInternalId = async (internalId) => {
+	const resp = await fetch(`${env.backendUrl}/api/tags/internal/${encodeURIComponent(internalId)}`, { method: 'DELETE' });
+	if (!resp.ok) {
+		let text = '';
+		try { text = await resp.text(); } catch (_) {}
+		throw new Error(`Failed to delete tag by internalId (status ${resp.status}): ${text}`);
+	}
+	return resp.json();
+};
+
 export const restoreTag = async (id) => {
 	const resp = await fetch(`${env.backendUrl}/api/tags/${encodeURIComponent(id)}/restore`, {
 		method: 'POST',
