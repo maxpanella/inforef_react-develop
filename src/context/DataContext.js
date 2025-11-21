@@ -28,16 +28,16 @@ export const DataProvider = ({ children }) => {
     };
     useEffect(() => { loadTags(); }, []);
 
-    const createTag = async (id, battery = null) => {
-      await apiCreateTag(String(id), battery);
+    const createTag = async (id, battery = null, name = null) => {
+      await apiCreateTag(String(id), battery, name);
       await loadTags();
       return true;
     };
 
     const removeTag = async (id) => {
-      await apiDeleteTag(String(id));
+      const res = await apiDeleteTag(String(id));
       await loadTags();
-      return true;
+      return res;
     };
     const restoreTag = async (id) => {
       await apiRestoreTag(String(id));
@@ -55,12 +55,37 @@ export const DataProvider = ({ children }) => {
   // Alias tag (mappa ID -> Nome personalizzato), persistiti in localStorage
   // Mappa nomi tag provenienti dal motore di posizione (auto, nessun alias manuale)
   const [tagNames, setTagNames] = useState({});
+  // Persistenza nomi su localStorage (cache fra riavvii)
   useEffect(() => {
+    try {
+      const cached = JSON.parse(localStorage.getItem('blueiot_tag_names') || 'null');
+      if (cached && typeof cached === 'object') setTagNames(cached);
+    } catch(_) {}
     const onNames = (map) => {
-      setTagNames(prev => ({ ...prev, ...map }));
+      if (!map || typeof map !== 'object') return;
+      setTagNames(prev => {
+        const merged = { ...prev, ...map };
+        try { localStorage.setItem('blueiot_tag_names', JSON.stringify(merged)); } catch(_) {}
+        return merged;
+      });
+      // Auto-crea tag nel backend se non esiste ancora
+      try {
+        const currentIds = new Set(tags.map(t => String(t.id)));
+        Object.keys(map).forEach(id => {
+          const sid = String(id);
+          if (!currentIds.has(sid)) {
+            // crea tag con nome se nuovo (batteria ignota -> null)
+            apiCreateTag(sid, null, map[sid]).catch(()=>{});
+          }
+        });
+      } catch(_) {}
     };
     LocalsenseClient.on('tagNames', onNames);
     return () => LocalsenseClient.off('tagNames', onNames);
+  }, [tags]);
+  const clearCachedTagNames = useCallback(() => {
+    try { localStorage.removeItem('blueiot_tag_names'); } catch(_) {}
+    setTagNames({});
   }, []);
 
   // Calibrazione mappa per sito corrente (scala, offset, flip/rotazione)
@@ -484,6 +509,7 @@ export const DataProvider = ({ children }) => {
       positions,
       isConnected,
   tagNames,
+  clearCachedTagNames,
       calibration,
       updateCalibration,
         updateTagOverride,

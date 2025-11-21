@@ -199,6 +199,22 @@ db.serialize(() => {
 			if (!hasDecom) {
 				try { db.run(`ALTER TABLE tags ADD COLUMN decommissionedAt DATETIME`); } catch(_) {}
 			}
+			// Extended schema columns required for richer tag telemetry & naming
+			const neededCols = [
+				{ name: 'name', ddl: 'ALTER TABLE tags ADD COLUMN name TEXT' },
+				{ name: 'lastSeen', ddl: 'ALTER TABLE tags ADD COLUMN lastSeen DATETIME' },
+				{ name: 'rawX', ddl: 'ALTER TABLE tags ADD COLUMN rawX REAL' },
+				{ name: 'rawY', ddl: 'ALTER TABLE tags ADD COLUMN rawY REAL' },
+				{ name: 'mapX', ddl: 'ALTER TABLE tags ADD COLUMN mapX REAL' },
+				{ name: 'mapY', ddl: 'ALTER TABLE tags ADD COLUMN mapY REAL' },
+				{ name: 'status', ddl: 'ALTER TABLE tags ADD COLUMN status TEXT' }
+			];
+			const existing = new Set(rows.map(r => String(r.name)));
+			neededCols.forEach(col => {
+				if (!existing.has(col.name)) {
+					try { db.run(col.ddl); } catch(_) {}
+				}
+			});
 		});
 	} catch(_) {}
 });
@@ -433,63 +449,117 @@ app.get('/api/map-config/:siteId', (req, res) => {
 
 // Simple Tag Registry endpoints
 app.get('/api/tags', (req, res) => {
-	db.all(`SELECT id, battery, decommissionedAt FROM tags ORDER BY id ASC`, [], (err, rows) => {
+	// Non includiamo coordinate per non duplicare lo storage di tracking BlueIOT
+	db.all(`SELECT id, battery, name, lastSeen, status, decommissionedAt FROM tags ORDER BY id ASC`, [], (err, rows) => {
 		if (err) return res.status(500).json({ error: 'DB error' });
 		res.json(rows || []);
 	});
 });
 
+
+// Helper: normalize and generate ID variants to match stored forms (hex/dec/raw)
+function buildIdVariants(inputId) {
+	const out = new Set();
+	if (inputId === null || typeof inputId === 'undefined') return Array.from(out);
+	try {
+		const s = String(inputId).trim();
+		if (!s) return Array.from(out);
+		out.add(s);
+		const hx = s.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+		if (hx) {
+			out.add(hx);
+			out.add('0x' + hx);
+			if (hx.length >= 8) {
+				try {
+					const low32 = String((parseInt(hx.slice(-8), 16) >>> 0));
+					out.add(low32);
+				} catch (_) {}
+			}
+		}
+		if (/^[0-9]+$/.test(s)) {
+			try {
+				const n = (Number(s) >>> 0);
+				const dec = String(n);
+				const h8 = n.toString(16).toUpperCase().padStart(8, '0');
+				out.add(dec);
+				out.add(h8);
+				out.add('0x' + h8);
+			} catch (_) {}
+		}
+	} catch (_) {}
+	return Array.from(out);
+}
+
+
 app.post('/api/tags', (req, res) => {
-	const { id, battery } = req.body || {};
-	if (!id || typeof id !== 'string') {
+	let { id } = req.body || {};
+	if (id === null || typeof id === 'undefined') {
 		return res.status(400).json({ error: 'Missing tag id' });
 	}
-	// Normalize battery only if a numeric value was explicitly provided (avoid treating null as 0)
+	// Coerce to trimmed string to accept numeric IDs
+	id = String(id).trim();
+	if (!id) {
+		return res.status(400).json({ error: 'Invalid tag id' });
+	}
+	let { battery, name, lastSeen, status } = req.body;
 	let batt = null;
 	if (battery !== null && battery !== undefined && battery !== '') {
 		const num = Number(battery);
 		if (Number.isFinite(num)) batt = num;
 	}
-	console.log('[POST /api/tags] incoming', { id, batteryRaw: battery, parsedBattery: batt });
-	const sql = batt === null ? `REPLACE INTO tags (id, battery) VALUES (?, COALESCE((SELECT battery FROM tags WHERE id = ?), -1))` : `REPLACE INTO tags (id, battery) VALUES (?, ?)`;
-	const params = batt === null ? [id, id] : [id, batt];
+	if (!lastSeen) lastSeen = new Date().toISOString();
+	console.log('[POST /api/tags] upsert (no coords)', { id, batt, name, lastSeen, status });
+	const sql = `INSERT INTO tags (id, battery, name, lastSeen, status)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			battery = CASE WHEN excluded.battery IS NULL THEN tags.battery ELSE excluded.battery END,
+			name = COALESCE(excluded.name, tags.name),
+			lastSeen = COALESCE(excluded.lastSeen, tags.lastSeen),
+			status = COALESCE(excluded.status, tags.status)`;
+	const params = [id, batt, name || null, lastSeen, status || null];
 	db.run(sql, params, (err) => {
-		if (err) return res.status(500).json({ error: 'DB error' });
+		if (err) return res.status(500).json({ error: 'DB error', details: err.message });
 		res.json({ success: true });
 	});
 });
 
 app.delete('/api/tags/:id', (req, res) => {
-	const id = req.params.id;
-	if (!id) return res.status(400).json({ error: 'Missing tag id' });
-	console.log('[DELETE /api/tags/:id] requested', id);
-	// Hard delete only if no assignments/positions/associations exist; otherwise soft-delete
-	db.serialize(() => {
-		db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
-			if (errA) return res.status(500).json({ error: 'DB error' });
-			db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
-				if (errP) return res.status(500).json({ error: 'DB error' });
-				db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
-					if (errS) return res.status(500).json({ error: 'DB error' });
-					const hasHistory = !!(rowA || rowP || rowS);
-					if (!hasHistory) {
-						// Hard delete - remove dependent records and the tag itself
-						db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
-							if (errDel) return res.status(500).json({ error: 'DB error' });
-							return res.json({ success: true, removed: this.changes || 0, soft: false });
-						});
-					} else {
-						// Soft delete - mark decommissioned and clear current association snapshot
-						db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
-							if (errU) return res.status(500).json({ error: 'DB error' });
-							db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
-								return res.json({ success: true, removed: 0, soft: true });
+	const reqId = req.params.id;
+	if (!reqId) return res.status(400).json({ error: 'Missing tag id' });
+	const variants = buildIdVariants(reqId);
+	console.log('[DELETE /api/tags/:id] requested', reqId, 'variants=', variants);
+	// Resolve the actual stored id using variants
+	const placeholders = variants.map(() => '?').join(',');
+	db.get(`SELECT id FROM tags WHERE id IN (${placeholders}) LIMIT 1`, variants, (err0, row0) => {
+		if (err0) return res.status(500).json({ error: 'DB error' });
+		const id = row0 ? row0.id : reqId; // fallback to requested
+		db.serialize(() => {
+			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+				if (errA) return res.status(500).json({ error: 'DB error' });
+				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+					if (errP) return res.status(500).json({ error: 'DB error' });
+					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+						if (errS) return res.status(500).json({ error: 'DB error' });
+						const hasHistory = !!(rowA || rowP || rowS);
+						if (!hasHistory) {
+							// Hard delete - remove dependent records and the tag itself
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+								if (errDel) return res.status(500).json({ error: 'DB error' });
+								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: id });
 							});
-						});
-					}
+						} else {
+							// Soft delete - mark decommissioned and clear current association snapshot
+							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+								if (errU) return res.status(500).json({ error: 'DB error' });
+								db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
+									return res.json({ success: true, removed: 0, soft: true, matchedId: id });
+								});
+							});
+						}
+					});
 				});
 			});
 		});
@@ -498,33 +568,39 @@ app.delete('/api/tags/:id', (req, res) => {
 
 // Fallback for environments where DELETE might be blocked: POST /api/tags/:id/delete
 app.post('/api/tags/:id/delete', (req, res) => {
-	const id = req.params.id;
-	if (!id) return res.status(400).json({ error: 'Missing tag id' });
-	console.log('[POST /api/tags/:id/delete] requested', id);
-	db.serialize(() => {
-		db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
-			if (errA) return res.status(500).json({ error: 'DB error' });
-			db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
-				if (errP) return res.status(500).json({ error: 'DB error' });
-				db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
-					if (errS) return res.status(500).json({ error: 'DB error' });
-					const hasHistory = !!(rowA || rowP || rowS);
-					if (!hasHistory) {
-						db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
-						db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
-							if (errDel) return res.status(500).json({ error: 'DB error' });
-							return res.json({ success: true, removed: this.changes || 0, soft: false });
-						});
-					} else {
-						db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
-							if (errU) return res.status(500).json({ error: 'DB error' });
-							db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
-								return res.json({ success: true, removed: 0, soft: true });
+	const reqId = req.params.id;
+	if (!reqId) return res.status(400).json({ error: 'Missing tag id' });
+	const variants = buildIdVariants(reqId);
+	console.log('[POST /api/tags/:id/delete] requested', reqId, 'variants=', variants);
+	const placeholders = variants.map(() => '?').join(',');
+	db.get(`SELECT id FROM tags WHERE id IN (${placeholders}) LIMIT 1`, variants, (err0, row0) => {
+		if (err0) return res.status(500).json({ error: 'DB error' });
+		const id = row0 ? row0.id : reqId;
+		db.serialize(() => {
+			db.get(`SELECT 1 FROM tag_assignments WHERE tagId = ? LIMIT 1`, [id], (errA, rowA) => {
+				if (errA) return res.status(500).json({ error: 'DB error' });
+				db.get(`SELECT 1 FROM tag_positions WHERE tagId = ? LIMIT 1`, [id], (errP, rowP) => {
+					if (errP) return res.status(500).json({ error: 'DB error' });
+					db.get(`SELECT 1 FROM associations WHERE tagId = ? LIMIT 1`, [id], (errS, rowS) => {
+						if (errS) return res.status(500).json({ error: 'DB error' });
+						const hasHistory = !!(rowA || rowP || rowS);
+						if (!hasHistory) {
+							db.run(`DELETE FROM associations WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tag_assignments WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tag_power WHERE tagId = ?`, [id]);
+							db.run(`DELETE FROM tags WHERE id = ?`, [id], function(errDel) {
+								if (errDel) return res.status(500).json({ error: 'DB error' });
+								return res.json({ success: true, removed: this.changes || 0, soft: false, matchedId: id });
 							});
-						});
-					}
+						} else {
+							db.run(`UPDATE tags SET decommissionedAt = CURRENT_TIMESTAMP WHERE id = ?`, [id], (errU) => {
+								if (errU) return res.status(500).json({ error: 'DB error' });
+								db.run(`DELETE FROM associations WHERE tagId = ?`, [id], () => {
+									return res.json({ success: true, removed: 0, soft: true, matchedId: id });
+								});
+							});
+						}
+					});
 				});
 			});
 		});

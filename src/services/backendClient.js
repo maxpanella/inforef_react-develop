@@ -94,9 +94,15 @@ export const getTags = async () => {
 	return resp.json();
 };
 
-export const createTag = async (id, battery = null) => {
-	let body = { id };
+export const createTag = async (id, battery = null, name = null, status = null, lastSeen = null) => {
+	const body = { id };
 	if (battery !== null && battery !== undefined && battery !== '') body.battery = battery;
+	if (name !== null && name !== undefined && String(name).trim() !== '') body.name = String(name).trim();
+	if (status !== null && status !== undefined && String(status).trim() !== '') body.status = String(status).trim();
+	if (lastSeen) {
+		try { const d = new Date(lastSeen); if (!isNaN(d.getTime())) body.lastSeen = d.toISOString(); } catch(_) {}
+	}
+	if (!body.lastSeen) body.lastSeen = new Date().toISOString();
 	const resp = await fetch(`${env.backendUrl}/api/tags`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -105,7 +111,7 @@ export const createTag = async (id, battery = null) => {
 	if (!resp.ok) {
 		let text = '';
 		try { text = await resp.text(); } catch(_) {}
-		throw new Error(`Failed to create tag (status ${resp.status}): ${text}`);
+		throw new Error(`Failed to upsert tag (status ${resp.status}): ${text}`);
 	}
 	return resp.json();
 };

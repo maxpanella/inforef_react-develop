@@ -69,6 +69,21 @@ const DashboardPage = () => {
     } catch { return new Set(); }
   }, [tags]);
 
+  // Mappa ID canonico -> nome da anagrafica (DB). Usata come fonte primaria per il display
+  const backendTagNameMap = React.useMemo(() => {
+    try {
+      const m = {};
+      (tags || []).forEach(t => {
+        try {
+          const c = canonicalizeId(t.id);
+          const nm = (t && typeof t.name === 'string' && t.name.trim()) ? t.name.trim() : null;
+          if (c && nm) m[String(c)] = nm;
+        } catch(_) {}
+      });
+      return m;
+    } catch { return {}; }
+  }, [tags]);
+
   const [mapData, setMapData] = useState(null);
   const [enhancedPositions, setEnhancedPositions] = useState({});
   const [selectedTag, setSelectedTag] = useState(null);
@@ -211,6 +226,36 @@ const DashboardPage = () => {
   const clearSelectedTagLocal = () => {
     if (!selectedTag) return;
     clearTagOverride(String(selectedTag));
+  };
+
+  // Rinomina (imposta/aggiorna nome) di un TAG registrato in anagrafica
+  const renameTag = async (rawId) => {
+    const canon = canonicalizeId(rawId);
+    if (!canon) return;
+    let name = window.prompt('Nuovo nome per questo TAG', '');
+    if (name === null) return; // annullato
+    name = String(name).trim();
+    try {
+      await createTag(canon, null, name || null);
+      await reloadTags();
+      setToast({ type: 'success', msg: `Nome aggiornato (${canon})` });
+    } catch(e) {
+      alert('Errore aggiornamento nome: ' + (e?.message || ''));
+    }
+  };
+
+  // Ancora l'origine mappa usando il tag selezionato: pivot = RAW del tag, offset = target - pivot
+  const anchorSelectedTagAsOrigin = (targetX = 0, targetY = 0) => {
+    if (!selectedTag) { alert('Seleziona prima un tag'); return; }
+    // Preferisci RAW dalla sorgente posizioni (pre-trasformazione)
+    const raw = positions[selectedTag] || positions[canonicalizeId(selectedTag)];
+    if (!raw || !isFinite(raw.x) || !isFinite(raw.y)) { alert('Posizione RAW non disponibile per il tag selezionato'); return; }
+    const pivX = Number(raw.x) || 0;
+    const pivY = Number(raw.y) || 0;
+    const offX = Number(targetX) - pivX;
+    const offY = Number(targetY) - pivY;
+    updateCalibration({ pivotX: pivX, pivotY: pivY, offsetX: offX, offsetY: offY });
+    try { setToast?.({ type: 'success', msg: `Ancora origine: pivot=(${pivX.toFixed(2)},${pivY.toFixed(2)}) ⇒ offset=(${offX.toFixed(2)},${offY.toFixed(2)})` }); } catch(_) {}
   };
   
   const [isLoading, setIsLoading] = useState(true);
@@ -728,7 +773,12 @@ EOF`;
     const truncated = positionsWithInfo.slice(0, MAX_TAGS);
 
     // Helper: risolvi nome anche provando varianti ID (dec/hex/low32)
+    // Primary resolver: prefer DB name by canonical ID, fallback to live names from BlueIOT
     const resolveName = (id) => {
+      try {
+        const canon = canonicalizeId(id);
+        if (backendTagNameMap && backendTagNameMap[canon]) return backendTagNameMap[canon];
+      } catch(_) {}
       const names = tagNames || {};
       const variants = new Set();
       const s = String(id || '');
@@ -783,7 +833,7 @@ EOF`;
       return !Number.isNaN(n) ? `0x${(n>>>0).toString(16).toUpperCase().padStart(8,'0')}` : s;
     };
     truncated.forEach(p => {
-      const tName = resolveName(p.tagId);
+      const tName = resolveName(p.canonId || p.tagId);
       const key = p.canonId || p.tagId; // p.canonId è già canonicalizzato sopra
       mapObj[key] = { ...p, id: p.tagId, idHexShown: displayId(p), name: tName || p.name };
       // Mantieni anche RAW per debug (prima della calibrazione) allineato alla chiave canonica
@@ -812,7 +862,7 @@ EOF`;
     });
     try { window.__DEBUG_RAW = rawObj; } catch(_) {}
     console.log("Tag positions enhanced:", Object.keys(mapObj).length, "(active recent=", totalActive, "truncated to", MAX_TAGS, ")");
-  }, [positions, tagAssociations, employees, assets, isConnected, tagNames, calibration, useRawPositions, selectedTag, forceClamp, mapBounds]);
+  }, [positions, tagAssociations, employees, assets, isConnected, tagNames, backendTagNameMap, calibration, useRawPositions, selectedTag, forceClamp, mapBounds]);
 
   // Auto-hide toast after a short delay
   useEffect(() => {
@@ -974,8 +1024,11 @@ EOF`;
     if (!raw) return;
     const canon = canonicalizeId(raw);
     if (!canon) { alert('ID non valido'); return; }
+    // Nome opzionale
+    let name = window.prompt('Nome (facoltativo) per questo TAG', '');
+    if (name) name = name.trim();
     try {
-      await createTag(canon, null);
+      await createTag(canon, null, name || null);
       await reloadTags();
       setToast({ type: 'success', msg: `Tag ${canon} aggiunto` });
     } catch(e) {
@@ -987,7 +1040,10 @@ EOF`;
     const canon = canonicalizeId(rawId);
     if (!canon) return;
     try {
-      await createTag(canon, null);
+      // nome opzionale
+      let name = window.prompt('Nome (facoltativo) per questo TAG', '');
+      if (name) name = name.trim();
+      await createTag(canon, null, name || null);
       await reloadTags();
       setToast({ type: 'success', msg: `Tag ${canon} aggiunto` });
     } catch(e) {
@@ -1003,9 +1059,19 @@ EOF`;
 • Altrimenti: sarà marcato come dismesso (soft delete).`);
     if (!confirm) return;
     try {
-      await removeTag(canon);
+      const res = await removeTag(canon);
       await reloadTags();
-      setToast({ type: 'success', msg: `Richiesta di rimozione eseguita per ${canon}` });
+      if (res && res.success) {
+        if (res.soft) {
+          setToast({ type: 'success', msg: `Tag ${res.matchedId || canon} dismesso (soft delete)` });
+        } else if ((res.removed || 0) > 0) {
+          setToast({ type: 'success', msg: `Tag ${res.matchedId || canon} eliminato definitivamente` });
+        } else {
+          setToast({ type: 'info', msg: `Nessun tag trovato con ID ${canon}. Prova variante HEX/DEC.` });
+        }
+      } else {
+        setToast({ type: 'info', msg: `Rimozione completata, verifica elenco aggiornata` });
+      }
       // se stavi selezionando proprio quel tag e non è più in live, pulisci selezione
       if (selectedTag && canonicalizeId(selectedTag) === canon && !enhancedPositions[canon]) {
         setSelectedTag(null);
@@ -1629,6 +1695,7 @@ EOF`;
               <div className="mt-3 flex gap-2 flex-wrap text-xs">
                 <button onClick={centerSelectedTag} className="px-2 py-1 bg-indigo-600 text-white rounded" title="Centra (offset globale - muove tutti)">Centra (globale)</button>
                 <button onClick={placeSelectedTag} className="px-2 py-1 bg-purple-600 text-white rounded" title="Posiziona (offset globale - muove tutti)">Posiziona (globale)</button>
+                <button onClick={() => anchorSelectedTagAsOrigin(0,0)} className="px-2 py-1 bg-blue-700 text-white rounded" title="Imposta origine mappa su 0,0 usando il RAW del tag selezionato (pivot=RAW, offset=target-RAW)">Ancora a 0,0</button>
                 <span className="inline-block w-px h-5 bg-gray-300 mx-1 align-middle" />
                 <button onClick={centerSelectedTagLocal} className="px-2 py-1 bg-emerald-700 text-white rounded" title="Centra solo questo tag (override locale)">Centra solo tag</button>
                 <button onClick={placeSelectedTagLocal} className="px-2 py-1 bg-emerald-600 text-white rounded" title="Posiziona solo questo tag (override locale)">Posiziona solo tag</button>
@@ -1637,7 +1704,10 @@ EOF`;
                   <button onClick={() => handleAddSpecificTag(selectedTag)} className="px-2 py-1 bg-emerald-700 text-white rounded" title="Aggiungi questo TAG all'anagrafica">Aggiungi TAG</button>
                 )}
                 {backendTagSet.has(canonicalizeId(selectedTag)) && (
-                  <button onClick={() => handleRemoveSpecificTag(selectedTag)} className="px-2 py-1 bg-rose-600 text-white rounded" title="Rimuovi questo TAG dall'anagrafica">Rimuovi TAG</button>
+                  <>
+                    <button onClick={() => renameTag(selectedTag)} className="px-2 py-1 bg-sky-600 text-white rounded" title="Rinomina questo TAG (anagrafica)">Rinomina</button>
+                    <button onClick={() => handleRemoveSpecificTag(selectedTag)} className="px-2 py-1 bg-rose-600 text-white rounded" title="Rimuovi questo TAG dall'anagrafica">Rimuovi TAG</button>
+                  </>
                 )}
                   {followSelected && (
                     <button onClick={() => { try { if (typeof window !== 'undefined') { window.__DXF_EXIT_FOLLOW = true; } } catch(_){}; setFollowSelected(false); }} className="px-2 py-1 bg-yellow-600 text-black rounded" title="Esci da follow">Esci da follow</button>
@@ -1664,10 +1734,23 @@ EOF`;
                           {info.name || `Tag ${info.idHexShown || tagId}`}
                         </div>
                         <div className="text-xs text-gray-500">
-                          {(info.idHexShown || tagId)} • ({info.x.toFixed(1)}, {info.y.toFixed(1)}) • age {Math.round(info.ageMs)}ms
+                          {(info.idHexShown || tagId)} / {canonicalizeId(tagId)} • ({info.x.toFixed(1)}, {info.y.toFixed(1)}) • age {Math.round(info.ageMs)}ms
                         </div>
                       </div>
-                      {!backendTagSet.has(canonicalizeId(tagId)) && (
+                      {backendTagSet.has(canonicalizeId(tagId)) ? (
+                        <div className="flex items-center gap-2">
+                          <button
+                            className="ml-2 px-2 py-0.5 text-[11px] rounded bg-sky-600 text-white hover:bg-sky-500"
+                            onClick={(e) => { e.stopPropagation(); renameTag(tagId); }}
+                            title="Rinomina TAG"
+                          >Rinomina</button>
+                          <button
+                            className="ml-1 px-2 py-0.5 text-[11px] rounded bg-rose-600 text-white hover:bg-rose-500"
+                            onClick={(e) => { e.stopPropagation(); handleRemoveSpecificTag(tagId); }}
+                            title="Rimuovi TAG"
+                          >Rimuovi</button>
+                        </div>
+                      ) : (
                         <button
                           className="ml-2 px-2 py-0.5 text-[11px] rounded bg-emerald-600 text-white hover:bg-emerald-500"
                           onClick={(e) => { e.stopPropagation(); handleAddSpecificTag(tagId); }}
