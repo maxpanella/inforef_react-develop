@@ -266,7 +266,7 @@ EOF`;
   // Carica la configurazione al montaggio del componente
   React.useEffect(() => {
     loadSavedConfiguration();
-  }, []);
+  }, [loadSavedConfiguration]);
 
   // Salva la configurazione corrente
   const saveCurrentConfiguration = () => {

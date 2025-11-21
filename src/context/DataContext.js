@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, restoreTag as apiRestoreTag } from "../services/backendClient";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { canonicalizeId } from "../services/tagCanonicalizer";
+import { getTags as apiGetTags, createTag as apiCreateTag, deleteTag as apiDeleteTag, deleteTagByInternalId as apiDeleteByInternalId, restoreTag as apiRestoreTag, fetchTagAssociations, saveAssociation as apiSaveAssociation, deleteAssociation as apiDeleteAssociation } from "../services/backendClient";
 import { LocalsenseClient } from "../services/localsenseClient";
 
 const DataContext = createContext(null);
